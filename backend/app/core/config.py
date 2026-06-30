@@ -8,7 +8,7 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    llm_provider: str = "claude"  # claude | solar
+    llm_provider: str = "solar"  # solar(기본) | claude | mock
     anthropic_api_key: str = ""
     solar_api_key: str = ""
     fred_api_key: str = ""
