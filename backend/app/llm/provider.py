@@ -317,6 +317,14 @@ class MockLLM:
                     "uncertainty": "medium",
                     "evidence_ids": ["causal-0001"],
                 },
+                {
+                    "sector": "2차전지",
+                    "direction": "negative",
+                    "strength": "medium",
+                    "rationale": "고금리에 따른 전기차 수요 둔화·자금조달 부담",
+                    "uncertainty": "high",
+                    "evidence_ids": ["causal-0003"],
+                },
             ]
         }
 
@@ -325,6 +333,7 @@ class MockLLM:
             "ranking": [
                 {"sector": "AI/SW", "score": 0.62, "rationale": "상대 방어 우위"},
                 {"sector": "반도체", "score": 0.31, "rationale": "사이클·금리 동반 부담"},
+                {"sector": "2차전지", "score": 0.24, "rationale": "수요 둔화 부담"},
             ]
         }
 

@@ -200,6 +200,10 @@ class Nodes:
     # --- 12. 브리핑 합성 ---
     def briefing_synthesizer(self, state: MacroLensState) -> dict:
         insufficient = not state.get("data_sufficient", True) or not state.get("rag_context")
+        # 데이터/근거 부족 시 LLM 호출 없이 결정적 '근거 부족' 안내(AC-A3, 단정 금지·환각 0).
+        if insufficient:
+            text = prompts.INSUFFICIENT_BRIEFING.format(disclaimer=prompts.DISCLAIMER)
+            return self._finalize_briefing(state, text)
         try:
             text = self.llm.generate(
                 prompts.briefing_messages(
@@ -232,20 +236,21 @@ class Nodes:
                 "disclaimer": prompts.DISCLAIMER,
             }
             return {"briefing": fallback, "errors": [note]}
-        # 면책 강제(AC-G2): 누락 시 보강.
+        return self._finalize_briefing(state, text)
+
+    def _finalize_briefing(self, state: MacroLensState, text: str) -> dict:
+        """면책 강제(AC-G2) + BriefingResult 구성 + 영속화(전환 탐지 기준)."""
         if prompts.DISCLAIMER not in text:
             text = f"{text.rstrip()}\n\n{prompts.DISCLAIMER}"
-        conclusion = _first_line(text)
         briefing: BriefingResult = {
             "thread_id": state["thread_id"],
-            "conclusion": conclusion,
+            "conclusion": _first_line(text),
             "body": text,
             "sectors": state.get("transitions", []),
             "coins": state.get("coin_mapping", []),
             "changes": state.get("changes", []),
             "disclaimer": prompts.DISCLAIMER,
         }
-        # 영속화(다음 브리핑의 전환 탐지 기준).
         if self.store:
             try:
                 payload = dict(briefing)
