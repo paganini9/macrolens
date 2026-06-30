@@ -1,4 +1,4 @@
-# MacroLens backend (Python 3.12) — Phase 0 base. 데이터 레이어 libs(yfinance·fredapi 등)는 Phase 1에서 추가.
+# MacroLens backend (Python 3.12). 무거운 RAG 임베딩/리랭킹은 requirements-optional.txt(선택).
 fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.7
@@ -13,3 +13,5 @@ anthropic>=0.40
 openai>=1.81  # Solar(Upstage) provider (OpenAI 호환 chat completions)
 chromadb>=0.5
 pandas>=2.2
+yfinance>=0.2  # keyless FX/지수 폴백(02 데이터). lazy import — 미설치여도 동작
+logfire>=2.0   # 관측성(09). LOGFIRE_TOKEN 없으면 no-op — lazy import

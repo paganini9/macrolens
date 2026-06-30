@@ -1,0 +1,8 @@
+# 선택적 RAG 품질 향상 의존성 (무거움 — torch/transformers 동반, 모델 런타임 다운로드).
+# 미설치 시 RAG 는 기본 임베딩(all-MiniLM, onnx)으로 graceful fallback 한다.
+#
+# 활성화:
+#   pip install -r requirements-optional.txt
+#   MACROLENS_RAG_EMBED=e5      # 다국어 임베딩(intfloat/multilingual-e5-small)
+#   MACROLENS_RAG_RERANK=1      # 크로스 인코더 리랭킹
+sentence-transformers>=2.2.0

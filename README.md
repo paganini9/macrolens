@@ -51,3 +51,11 @@ streamlit run app.py --server.port 8202
 | RAG 코퍼스(읽기) | `../rag_corpus` | `/app/rag_corpus` (ro) | `RAG_CORPUS_DIR` |
 | Chroma(임베디드) | `./.chroma` | `/app/data/chroma` | `CHROMA_DIR` |
 | SQLite(핀·히스토리) | `./macrolens.db` | `/app/data/macrolens.db` | `SQLITE_PATH` |
+
+## 옵션 기능 (full-scale, 모두 미설정 시 자동 폴백/no-op)
+- **RAG 다국어 임베딩·리랭킹**: `pip install -r backend/requirements-optional.txt` 후
+  `MACROLENS_RAG_EMBED=e5`(다국어 임베딩) / `MACROLENS_RAG_RERANK=1`(크로스 인코더 리랭킹).
+  미설치 시 기본 임베딩(all-MiniLM)으로 동작. 평가: `python -m app.rag.eval`.
+- **관측성(Logfire)**: `LOGFIRE_TOKEN` 설정 시 FastAPI 트레이싱 활성(없으면 no-op).
+- **데이터 키**: `.env`에 FRED·ECOS·FMP 키 설정 시 실데이터 수집(CoinGecko는 keyless). 키 없으면 Mock.
+- **CI**: `.github/workflows/ci.yml` — push/PR 시 backend ruff+pytest, frontend pytest.
