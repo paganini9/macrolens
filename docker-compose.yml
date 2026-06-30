@@ -1,24 +1,31 @@
-# MacroLens 전용 포트 대역(82xx) — 다른 프로젝트(OntologyResearch 등) Docker와 충돌 회피.
+# MacroLens 전용 포트 대역(82xx) — 다른 프로젝트 Docker와 충돌 회피.
 # host:container 매핑. 컨테이너 내부 포트는 표준 유지(8000/8501).
+#
+# Chroma 는 backend 가 임베디드 PersistentClient(파일 기반)로 사용한다(app/rag/index.py).
+# 별도 chroma 서버 컨테이너를 띄우지 않고, CHROMA_DIR 을 영속 볼륨(backend_data)에 둔다
+# → 로컬(.chroma)과 컨테이너가 동일한 임베디드 모드(패리티). SQLite·ledger 도 같은 볼륨.
+# (서버 모드(HttpClient)로 전환 시 chroma 서비스를 추가하고 RAG 레이어를 교체한다.)
 services:
-  chroma:
-    image: chromadb/chroma:0.5.5
-    ports:
-      - "8201:8000"
-    volumes:
-      - chroma_data:/data
   backend:
     build: ./backend
-    env_file: ./backend/.env
+    env_file:
+      - path: ./backend/.env
+        required: false        # 시크릿(.env)이 없어도 기동(solar 키 없으면 합성은 폴백)
     environment:
-      - RAG_CORPUS_DIR=/app/rag_corpus
+      - RAG_CORPUS_DIR=/app/rag_corpus       # 읽기: 마운트된 코퍼스
+      - CHROMA_DIR=/app/data/chroma          # 영속: backend_data 볼륨
+      - SQLITE_PATH=/app/data/macrolens.db   # 영속: backend_data 볼륨
     ports:
       - "8200:8000"
     volumes:
-      - ./rag_corpus:/app/rag_corpus
-      - backend_data:/app/data
-    depends_on:
-      - chroma
+      - ./rag_corpus:/app/rag_corpus:ro      # 코퍼스는 읽기 전용 마운트
+      - backend_data:/app/data               # Chroma·SQLite·ledger 영속
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/v1/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s        # 최초 기동 시 RAG 인덱싱·임베딩 모델 로드 여유
   frontend:
     build: ./frontend
     environment:
@@ -26,7 +33,7 @@ services:
     ports:
       - "8202:8501"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 volumes:
-  chroma_data:
   backend_data:

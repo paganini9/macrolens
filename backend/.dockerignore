@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .env
 tests/
+# 로컬 런타임 산출물(이미지에 넣지 않음 — 볼륨으로 영속)
+.chroma/
+*.db
+*.db-wal
+*.db-shm
+.pytest_cache/
