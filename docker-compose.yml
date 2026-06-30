@@ -1,0 +1,32 @@
+# MacroLens 전용 포트 대역(82xx) — 다른 프로젝트(OntologyResearch 등) Docker와 충돌 회피.
+# host:container 매핑. 컨테이너 내부 포트는 표준 유지(8000/8501).
+services:
+  chroma:
+    image: chromadb/chroma:0.5.5
+    ports:
+      - "8201:8000"
+    volumes:
+      - chroma_data:/data
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    environment:
+      - RAG_CORPUS_DIR=/app/rag_corpus
+    ports:
+      - "8200:8000"
+    volumes:
+      - ./rag_corpus:/app/rag_corpus
+      - backend_data:/app/data
+    depends_on:
+      - chroma
+  frontend:
+    build: ./frontend
+    environment:
+      - BACKEND_URL=http://backend:8000
+    ports:
+      - "8202:8501"
+    depends_on:
+      - backend
+volumes:
+  chroma_data:
+  backend_data:
