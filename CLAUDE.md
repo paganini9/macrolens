@@ -9,7 +9,7 @@
 - 포트 = **MacroLens 전용 82xx** (다른 프로젝트 Docker와 충돌 회피):
   - backend 8200(→8000), frontend 8202(→8501), chroma 8201(→8000).
   - 로컬: `uvicorn app.main:app --reload --port 8200` → http://localhost:8200/api/v1/health
-- 시크릿: `backend/.env`(`.env.example` 복사). **절대 커밋·출력 금지**(.gitignore 등록됨). RAG는 키 불필요, 데이터 레이어만 FRED·ECOS·FMP·ANTHROPIC 키 필요.
+- 시크릿: `backend/.env`(`.env.example` 복사). **절대 커밋·출력 금지**(.gitignore 등록됨). RAG는 키 불필요, 데이터 레이어만 FRED·ECOS·FMP·ANTHROPIC 키 필요. Solar(Upstage) provider는 `SOLAR_API_KEY` + `../agents/03_dev_team/공유표준/참고_solar_upstage.md`(키 하드코딩 금지).
 
 ## 아키텍처 (레이어 경계 — 자기 담당 경로만 수정)
 ```

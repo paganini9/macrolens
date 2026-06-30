@@ -24,6 +24,9 @@ logger = get_logger(__name__)
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_TOKENS = 1024
 DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-latest"
+# Solar(Upstage) — OpenAI 호환 chat completions (참고_solar_upstage.md)
+DEFAULT_MODEL_SOLAR = "solar-pro3"
+SOLAR_BASE_URL = "https://api.upstage.ai/v1"
 
 
 @runtime_checkable
@@ -149,10 +152,36 @@ class ClaudeProvider:
 
 
 class SolarProvider:
-    """Upstage Solar provider 스텁(LLM_PROVIDER=solar). 실연결은 후속."""
+    """Upstage Solar provider (LLM_PROVIDER=solar). OpenAI 호환 chat completions.
 
-    def __init__(self, api_key: str | None = None):
+    - base_url=https://api.upstage.ai/v1, model=solar-pro3, 키=settings.solar_api_key.
+    - schema 지정 시: 프롬프트로 JSON 강제 + 후처리 파싱(Anthropic 경로와 동일 규약).
+    - 재현성: 분기 노드는 temperature 낮게 호출(노드 측에서 0 지정).
+    - client 주입 가능(테스트에서 네트워크 없이 검증).
+    """
+
+    def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL_SOLAR, client=None):
         self._api_key = api_key if api_key is not None else settings.solar_api_key
+        self._model = model
+        self._client = client  # 주입 시 lazy init 생략
+
+    def _ensure_client(self):
+        if self._client is not None:
+            return self._client
+        if not self._api_key:
+            raise LLMError(
+                "Solar API 키가 설정되지 않았습니다. .env에 SOLAR_API_KEY를 추가해 주세요.",
+                internal_detail="settings.solar_api_key is empty",
+            )
+        try:
+            from openai import OpenAI  # 지연 import
+        except ImportError as e:  # pragma: no cover
+            raise LLMError(
+                "openai SDK가 설치되지 않았습니다. `pip install openai`를 실행해 주세요.",
+                internal_detail=str(e),
+            ) from e
+        self._client = OpenAI(api_key=self._api_key, base_url=SOLAR_BASE_URL)
+        return self._client
 
     def generate(
         self,
@@ -161,10 +190,30 @@ class SolarProvider:
         temperature: float = DEFAULT_TEMPERATURE,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> dict | str:
-        raise LLMError(
-            "Solar provider는 아직 연결되지 않았습니다. LLM_PROVIDER=claude로 설정해 주세요.",
-            internal_detail="SolarProvider.generate is a stub",
-        )
+        client = self._ensure_client()
+        chat = list(messages)
+        if schema is not None:
+            # OpenAI 호환: system 역할로 JSON 강제 지시 주입(Anthropic 경로와 동일 후처리).
+            chat = chat + [{"role": "system", "content": _schema_instruction(schema)}]
+        try:
+            resp = client.chat.completions.create(
+                model=self._model,
+                messages=chat,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=False,
+            )
+            text = resp.choices[0].message.content or ""
+        except LLMError:
+            raise
+        except Exception as e:  # pragma: no cover - 네트워크/SDK 오류
+            raise LLMError(
+                "LLM 호출에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+                internal_detail=f"{type(e).__name__}: {e}",
+            ) from e
+        if schema is not None:
+            return _parse_json(text)
+        return text
 
 
 class MockLLM:
@@ -196,13 +245,19 @@ class MockLLM:
         temperature: float = DEFAULT_TEMPERATURE,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> dict | str:
+        # [NODE:xxx] 표지는 system 프롬프트에 있으므로 전체에서 탐지하되,
+        # 키워드 분기(차단/의도)는 **사용자 메시지**로만 판정한다.
+        # (system 지시문이 차단 키워드를 서술하므로 전체를 보면 오탐된다.)
         joined = "\n".join(m.get("content", "") for m in messages)
+        user_text = "\n".join(
+            m.get("content", "") for m in messages if m.get("role") == "user"
+        )
         tag = self._detect_tag(joined, schema)
         if tag in self._overrides:
             return self._overrides[tag]
         handler = getattr(self, f"_gen_{tag}", None)
         if handler is not None:
-            return handler(joined)
+            return handler(user_text)
         # 스키마 없으면 자유 텍스트, 있으면 빈 dict 방어
         return {} if schema is not None else "MOCK_RESPONSE"
 
@@ -225,9 +280,11 @@ class MockLLM:
 
     # --- 노드별 결정적 출력 ---
     def _gen_safety_guardrail(self, text: str) -> dict:
-        # 명백한 추천/단정 매수 요청만 차단(보수적이되 데모 통과 위해 기본 allow).
-        lowered = text.lower()
-        block_kw = ["사라고", "꼭 사", "추천 종목", "보장", "100% 수익"]
+        # 개별종목 매매 신호/추천/수익보장 요청만 차단(기본 allow). text=사용자 메시지.
+        block_kw = [
+            "사도 될까", "사도 돼", "사야 할까", "사야 돼", "팔까", "팔아야",
+            "매수", "매도", "사라고", "꼭 사", "추천 종목", "보장", "100% 수익",
+        ]
         blocked = any(k in text for k in block_kw)
         return {
             "decision": "block" if blocked else "allow",

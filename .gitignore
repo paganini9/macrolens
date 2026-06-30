@@ -9,6 +9,8 @@ venv/
 # data build artifacts (소스 .md는 추적, 빌드물은 제외)
 rag_corpus/index/
 *.db
+*.db-wal
+*.db-shm
 *.sqlite3
 .chroma/
 chroma/

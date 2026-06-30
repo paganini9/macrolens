@@ -22,7 +22,8 @@ def test_error_to_dict():
 def test_circuit_breaker():
     cb = CircuitBreaker(fail_max=2, reset_timeout=999)
     assert cb.is_open is False
-    cb.record_failure(); cb.record_failure()
+    cb.record_failure()
+    cb.record_failure()
     assert cb.is_open is True
     cb.record_success()
     assert cb.is_open is False
