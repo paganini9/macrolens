@@ -1,0 +1,16 @@
+# secrets
+.env
+*.key
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# data build artifacts (소스 .md는 추적, 빌드물은 제외)
+rag_corpus/index/
+*.db
+*.sqlite3
+.chroma/
+chroma/
+# os
+.DS_Store

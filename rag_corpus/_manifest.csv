@@ -1,0 +1,6 @@
+date,path,collected_count,event
+2026-06-30,rag_corpus/news/2026-06-30.md,13,none
+2026-07-01,rag_corpus/cases/2022_금리인상_강달러.md,1,case-2022-ratehike
+2026-07-01,rag_corpus/knowledge/causal/causal-0001.md,1,causal-0001
+2026-07-01,rag_corpus/knowledge/causal/causal-0002.md,1,causal-0002
+2026-07-01,rag_corpus/knowledge/causal/causal-0003.md,1,causal-0003
