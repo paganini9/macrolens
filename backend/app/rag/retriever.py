@@ -8,6 +8,8 @@
   전체에서 top-k 를 고른다.
 - 섹터 메타 필터: 요청 sectors 와 hit 의 sectors 가 교집합이면 통과(sectors 비면 필터 없음).
 - lead_lag / lag_window(시차)를 그대로 통과시켜 하류 노드가 타이밍에 활용한다.
+- (선택) cross-encoder 재순위화: 환경변수 `MACROLENS_RAG_RERANK` 로 켜면 가중 점수 상위
+  후보를 cross-encoder 로 재정렬한다. sentence-transformers 미설치/오프라인이면 가중 점수로 graceful fallback.
 
 충분성 규칙(FR-12, `is_sufficient` 참고):
 - causal 타입 hit 가 1개 이상 존재하고,
@@ -18,6 +20,7 @@
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 from app.core.config import settings
@@ -29,6 +32,43 @@ from .chunking import meta_list
 from .index import COLLECTIONS, Indexer
 
 logger = get_logger(__name__)
+
+# 선택적 cross-encoder 재순위 모델 별칭 → 모델 id.
+_RERANK_ALIASES = {
+    "1": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    "true": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    "default": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    "marco": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    # 한·영 혼재 코퍼스용 다국어 reranker
+    "multilingual": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    "mmarco": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+}
+# 활성 reranker 1회 결정 후 캐시.
+_rerank_state: dict[str, Any] = {}
+
+
+def _resolve_reranker() -> Any:
+    """활성 cross-encoder 재순위 모델을 (최초 1회) 결정해 캐시.
+
+    환경변수 `MACROLENS_RAG_RERANK` 미설정/off → None(재순위 비활성, 가중 점수만 사용).
+    값이 있으면 sentence-transformers CrossEncoder 로드 시도, 실패 시 None 으로 graceful fallback.
+    """
+    if _rerank_state:
+        return _rerank_state["model"]
+    name = os.environ.get("MACROLENS_RAG_RERANK", "").strip()
+    model: Any = None
+    if name and name.lower() not in ("0", "false", "off", "none", ""):
+        model_id = _RERANK_ALIASES.get(name.lower(), name)
+        try:
+            from sentence_transformers import CrossEncoder  # 지연 import
+
+            ce = CrossEncoder(model_id)
+            ce.predict([("질의", "문서")])  # 모델 실제 로드·추론 가능 여부 확인
+            model = ce
+        except Exception:  # noqa: BLE001 - 미설치/오프라인/로드실패 → 재순위 비활성
+            model = None
+    _rerank_state["model"] = model
+    return model
 
 # 컬렉션 → Evidence.type 매핑
 _COLLECTION_TYPE = {
@@ -212,7 +252,36 @@ class ChromaRetriever:
                 scored.append((score, ev))
 
         scored.sort(key=lambda t: t[0], reverse=True)
+        # (선택) cross-encoder 재순위화 — 가용 시 상위 후보를 재정렬, 아니면 가중 점수 유지.
+        reranked = self._maybe_rerank(query_text, scored, k)
+        if reranked is not None:
+            return reranked
         return [ev for _, ev in scored[:k]]
+
+    @staticmethod
+    def _maybe_rerank(
+        query_text: str, scored: list[tuple[float, Evidence]], k: int
+    ) -> Optional[list[Evidence]]:
+        """cross-encoder 가 활성일 때 가중 점수 상위 후보를 재정렬해 top-k 반환.
+
+        - reranker 미가용/후보 없음 → None(호출부가 가중 점수 결과를 사용).
+        - 재순위 비용 절감을 위해 상위 max(k*3,12) 후보만 평가.
+        - 어떤 예외든 가중 점수로 graceful fallback(None 반환).
+        """
+        model = _resolve_reranker()
+        if model is None or not scored:
+            return None
+        try:
+            cand = scored[: max(k * 3, 12)]
+            pairs = [(query_text, ev.get("text", "") or "") for _, ev in cand]
+            ce_scores = model.predict(pairs)
+            order = sorted(
+                range(len(cand)), key=lambda i: float(ce_scores[i]), reverse=True
+            )
+            return [cand[i][1] for i in order[:k]]
+        except Exception as exc:  # noqa: BLE001 - 재순위 실패는 비치명적
+            logger.warning("rag.retriever.rerank_failed: %s", exc)
+            return None
 
     @staticmethod
     def _to_evidence(coll_name: str, chunk_id: str, document: str, meta: dict) -> Evidence:

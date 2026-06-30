@@ -1,7 +1,11 @@
 """RAG 인덱싱 — 파일 → ChromaDB(3 컬렉션) 멱등 증분 적재.
 
 - PersistentClient(settings.chroma_dir), 컬렉션 kb_causal·kb_cases·kb_news.
-- 임베딩: Chroma 임베디드 기본(all-MiniLM-L6-v2, onnxruntime) — API 키 불필요.
+- 임베딩(기본): Chroma 임베디드 all-MiniLM-L6-v2(onnxruntime) — API 키·추가 의존성 불필요.
+- 임베딩(선택, 한·영 혼재 품질 개선): 환경변수 `MACROLENS_RAG_EMBED` 로 다국어
+  sentence-transformers 모델(예: `e5`=intfloat/multilingual-e5-small, `bge-m3`)을 켤 수 있다.
+  라이브러리/모델이 없으면 자동으로 기본 임베딩으로 graceful fallback(설치 강제 안 함).
+  비기본 모델이 실제 활성화될 때만 `embed_model_version()` 이 바뀌어 ledger가 전체 재인덱싱을 트리거.
 - 증분 판별: 각 파일 내용 해시(content hash) + 임베딩 모델 버전을 ledger(SQLite)에 보관.
   해시 동일 + 모델 동일 → skip, 그 외 → 해당 문서 청크 재임베딩 upsert.
 - 진입점: `python -m app.rag.index` → index_incremental() 실행.
@@ -20,10 +24,56 @@ from app.core.config import settings
 from .chunking import chunk_doc, collection_for
 from .loader import iter_corpus_files, load_file
 
-# 임베딩 모델 버전 식별자(교체 시 전체 재인덱싱 트리거)
+# 기본 임베딩 모델 버전 식별자(교체 시 전체 재인덱싱 트리거)
 EMBED_MODEL_VERSION = "chroma-default-all-MiniLM-L6-v2"
 
 COLLECTIONS = ("kb_causal", "kb_cases", "kb_news")
+
+# 선택적 다국어 임베딩 별칭 → sentence-transformers 모델 id.
+_EMBED_ALIASES = {
+    "e5": "intfloat/multilingual-e5-small",
+    "e5-small": "intfloat/multilingual-e5-small",
+    "multilingual-e5-small": "intfloat/multilingual-e5-small",
+    "bge-m3": "BAAI/bge-m3",
+}
+# 활성 임베딩(함수·버전) 1회 결정 후 캐시.
+_embed_state: dict[str, Any] = {}
+
+
+def _resolve_embedding() -> tuple[Any, str]:
+    """활성 임베딩 함수와 버전 식별자를 (최초 1회) 결정해 캐시한다.
+
+    환경변수 `MACROLENS_RAG_EMBED`:
+    - 미설정/"default"/"minilm" → (None, 기본버전) ⇒ Chroma 임베디드 all-MiniLM 사용.
+    - 별칭 또는 sentence-transformers 모델 id → 다국어 임베딩 함수 시도.
+      sentence-transformers 미설치/모델 로드 실패 시 (None, 기본버전)으로 graceful fallback.
+    fn 이 None 이면 컬렉션 생성 시 embedding_function 인자를 생략(=기본 임베딩).
+    """
+    if _embed_state:
+        return _embed_state["fn"], _embed_state["version"]
+    name = os.environ.get("MACROLENS_RAG_EMBED", "").strip()
+    fn: Any = None
+    version = EMBED_MODEL_VERSION
+    if name and name.lower() not in ("default", "minilm", "all-minilm"):
+        model_id = _EMBED_ALIASES.get(name.lower(), name)
+        try:
+            from chromadb.utils import embedding_functions as _ef  # 지연 import
+
+            candidate = _ef.SentenceTransformerEmbeddingFunction(model_name=model_id)
+            candidate(["health check"])  # 모델 실제 로드·임베딩 가능 여부 확인
+            fn = candidate
+            version = f"st::{model_id}"
+        except Exception:  # noqa: BLE001 - 미설치/오프라인/로드실패 → 기본 폴백
+            fn = None
+            version = EMBED_MODEL_VERSION
+    _embed_state["fn"] = fn
+    _embed_state["version"] = version
+    return fn, version
+
+
+def embed_model_version() -> str:
+    """활성 임베딩 모델 버전 식별자(ledger 비교용). 비기본 모델이 켜질 때만 값이 바뀐다."""
+    return _resolve_embedding()[1]
 
 
 def content_hash(text: str) -> str:
@@ -89,7 +139,7 @@ class Ledger:
                     path=excluded.path, hash=excluded.hash, model_version=excluded.model_version,
                     collection=excluded.collection, chunk_ids=excluded.chunk_ids
                 """,
-                (doc_id, path, hash_, EMBED_MODEL_VERSION, collection, ",".join(chunk_ids)),
+                (doc_id, path, hash_, embed_model_version(), collection, ",".join(chunk_ids)),
             )
             self._conn.commit()
 
@@ -124,12 +174,18 @@ def get_client(chroma_dir: Optional[str] = None):
 
 
 def get_collections(client) -> dict[str, Any]:
-    """3 컬렉션 핸들 확보(없으면 생성). 기본 임베딩 함수 사용(all-MiniLM, onnx)."""
+    """3 컬렉션 핸들 확보(없으면 생성).
+
+    기본은 Chroma 임베디드 임베딩(all-MiniLM, onnx). `MACROLENS_RAG_EMBED` 로 다국어
+    임베딩이 활성화되면 해당 embedding_function 을 주입(없으면 인자 생략=기본).
+    """
+    fn, _ = _resolve_embedding()
     out: dict[str, Any] = {}
     for name in COLLECTIONS:
-        out[name] = client.get_or_create_collection(
-            name=name, metadata={"hnsw:space": "cosine"}
-        )
+        kwargs: dict[str, Any] = {"name": name, "metadata": {"hnsw:space": "cosine"}}
+        if fn is not None:
+            kwargs["embedding_function"] = fn
+        out[name] = client.get_or_create_collection(**kwargs)
     return out
 
 
@@ -183,7 +239,7 @@ class Indexer:
             doc = load_file(abs_path, self.corpus_dir)
             seen.add(doc.doc_id)
             prev = self.ledger.get(doc.doc_id)
-            if prev and prev.get("hash") == h and prev.get("model_version") == EMBED_MODEL_VERSION:
+            if prev and prev.get("hash") == h and prev.get("model_version") == embed_model_version():
                 skipped += 1
                 continue
             n = self._upsert_doc(doc, prev)
