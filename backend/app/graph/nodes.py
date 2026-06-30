@@ -30,6 +30,10 @@ logger = get_logger(__name__)
 # 기본 수집 지표(MVP). 정규 브리핑이 거시 코어를 본다.
 DEFAULT_INDICATORS = ["FFR", "DXY", "USDKRW", "US10Y"]
 
+# 코인 코드(섹터와 분리). 그래프 로컬 정의 — app.data 를 import 하지 않아 트랙 결합 회피.
+# 데이터 레이어가 동일 코드를 collect 지원하면 실시세가 macro_data[BTC/ETH] 로 흘러든다.
+COIN_CODES = ["BTC", "ETH"]
+
 
 def _target_sectors(state: MacroLensState) -> list[str]:
     """분석 대상 섹터 = 핀 우선, 없으면 유니버스."""
@@ -97,8 +101,10 @@ class Nodes:
     # --- 4. 데이터 수집 ---
     def data_collector(self, state: MacroLensState) -> dict:
         try:
+            # 거시 코어 + 코인 시세를 함께 요청(코인은 섹터와 분리해 macro_data[BTC/ETH] 로 보관).
+            # 데이터 레이어가 코인 코드를 지원하지 않으면 gap 으로 빠지므로 그래프는 그대로 완주한다.
             metrics: dict[str, Metric] = self.collector.collect(
-                state.get("market_scope", ["KR"]), DEFAULT_INDICATORS
+                state.get("market_scope", ["KR"]), DEFAULT_INDICATORS + COIN_CODES
             )
             gaps = list(self.collector.gaps())
         except AppError as e:
@@ -154,9 +160,12 @@ class Nodes:
 
     # --- 9. 코인 매핑 (섹터와 분리) ---
     def coin_mapper(self, state: MacroLensState) -> dict:
+        macro = state.get("macro_data", {})
+        # 수집된 코인 실시세만 추려 프롬프트에 실가격으로 주입(없으면 빈 dict → 일반 서술).
+        coin_prices = {c: macro[c] for c in COIN_CODES if c in macro}
         try:
             res = self.llm.generate(
-                prompts.coin_messages(state.get("macro_data", {}), state.get("rag_context", [])),
+                prompts.coin_messages(macro, state.get("rag_context", []), coin_prices=coin_prices),
                 schema=schemas.COIN_SCHEMA,
                 temperature=0.0,
             )
@@ -204,6 +213,9 @@ class Nodes:
         if insufficient:
             text = prompts.INSUFFICIENT_BRIEFING.format(disclaimer=prompts.DISCLAIMER)
             return self._finalize_briefing(state, text)
+        # deepdive 의도면 섹터 심층(depth=background) + 근거 상세 주입(라우팅은 불변).
+        deepdive = state.get("intent") == "deepdive"
+        depth = "background" if deepdive else state.get("depth", "evidence")
         try:
             text = self.llm.generate(
                 prompts.briefing_messages(
@@ -212,8 +224,10 @@ class Nodes:
                     state.get("sector_ranking", []),
                     state.get("coin_mapping", []),
                     state.get("changes", []),
-                    state.get("depth", "evidence"),
+                    depth,
                     insufficient=insufficient,
+                    deepdive=deepdive,
+                    evidence=state.get("rag_context", []),
                 ),
                 temperature=0.2,
             )

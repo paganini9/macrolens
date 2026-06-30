@@ -44,6 +44,15 @@ def _fmt_metrics(macro_data: dict[str, Metric]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_coin_prices(coin_prices: dict[str, Metric] | None) -> str:
+    if not coin_prices:
+        return "(코인 실시세 미수집 — 가격 인용 없이 방향만 서술)"
+    lines = []
+    for code, m in coin_prices.items():
+        lines.append(f"- {code}={m['value']}{m['unit']} (관측 {m['observed_at']}, 출처 {m['source']['title']})")
+    return "\n".join(lines)
+
+
 def _fmt_evidence(evidence: list[Evidence]) -> str:
     if not evidence:
         return "(검색 근거 없음)"
@@ -96,8 +105,11 @@ def transition_messages(macro_data: dict[str, Metric], evidence: list[Evidence],
         "transition_analyzer",
         "너는 거시→섹터 전이 분석가다.",
         f"분석 대상 섹터: {sectors}\n\n# 지표\n{_fmt_metrics(macro_data)}\n\n# 근거\n{_fmt_evidence(evidence)}",
-        "각 섹터에 대해 지표→메커니즘→섹터 인과 체인으로 방향·강도·근거를 판정하라. "
-        "반드시 위 근거 id 만 evidence_ids 로 인용하라. 수치를 창작하지 마라. 불확실성을 명시하라.",
+        "각 섹터에 대해 **지표→전달 메커니즘→섹터 영향**의 인과 체인을 명시적으로 밟아 "
+        "방향(positive/negative/neutral)·강도(high/medium/low)·근거를 판정하라. "
+        "rationale 에는 어떤 지표가 어떤 경로로 해당 섹터에 작용하는지 한 문장으로 적어라. "
+        "반드시 위 근거 id 만 evidence_ids 로 인용하라(목록에 없는 id·수치 창작 금지). "
+        "근거가 약하면 강도를 낮추고 uncertainty 에 한계를 솔직히 명시하라.",
         "JSON: {\"transitions\":[{\"sector\",\"direction\",\"strength\",\"rationale\",\"uncertainty\",\"evidence_ids\":[]}]}",
     )
     return [sys, {"role": "user", "content": "위 데이터·근거로 섹터 전이를 분석하라."}]
@@ -117,16 +129,21 @@ def ranking_messages(transitions: list[dict[str, Any]], sectors: list[str]) -> l
 
 
 # --- coin_mapper -----------------------------------------------------------
-def coin_messages(macro_data: dict[str, Metric], evidence: list[Evidence]) -> list[dict]:
+def coin_messages(
+    macro_data: dict[str, Metric],
+    evidence: list[Evidence],
+    coin_prices: dict[str, Metric] | None = None,
+) -> list[dict]:
     sys = _sys(
         "coin_mapper",
-        "너는 거시→코인 영향 분석가다. 코인은 섹터와 분리해 다룬다.",
-        f"# 지표\n{_fmt_metrics(macro_data)}\n\n# 근거\n{_fmt_evidence(evidence)}",
-        "거시 지표가 주요 코인(BTC/ETH 등)에 미치는 영향을 섹터와 분리해 판정하라. "
-        "근거 id 만 인용하고 수치를 창작하지 마라.",
+        "너는 거시→코인 영향 분석가다. 코인은 섹터와 **완전히 분리**해 다룬다(섹터 티커에 코인을 섞지 마라).",
+        f"# 거시 지표\n{_fmt_metrics(macro_data)}\n\n# 코인 실시세\n{_fmt_coin_prices(coin_prices)}\n\n# 근거\n{_fmt_evidence(evidence)}",
+        "위 코인 실시세를 기준으로, 거시 지표(금리·달러·유동성)가 각 코인에 미치는 영향을 "
+        "지표→유동성/리스크선호→코인 인과 체인으로 방향·강도와 함께 판정하라. "
+        "note 에는 위 실시세만 인용하고(가격 창작 금지), 근거 id 만 evidence_ids 로 인용하라.",
         "JSON: {\"coins\":[{\"ticker\",\"direction\",\"strength\",\"note\",\"evidence_ids\":[]}]}",
     )
-    return [sys, {"role": "user", "content": "코인 영향을 분석하라."}]
+    return [sys, {"role": "user", "content": "위 코인 실시세와 근거로 코인 영향을 분석하라."}]
 
 
 # --- scenario_analyzer -----------------------------------------------------
@@ -151,6 +168,8 @@ def briefing_messages(
     changes: list[dict[str, Any]],
     depth: str,
     insufficient: bool = False,
+    deepdive: bool = False,
+    evidence: list[Evidence] | None = None,
 ) -> list[dict]:
     insufficient_note = (
         "\n\n# 중요\n데이터/근거가 부족하다. 단정 표현을 쓰지 말고 '근거 부족'을 명시하며 "
@@ -158,17 +177,31 @@ def briefing_messages(
         if insufficient
         else ""
     )
+    # deepdive: 섹터별 심층(메커니즘·시차·근거 인용) + 검색 근거 상세를 추가 맥락으로 주입.
+    deepdive_ctx = (
+        f"\n# 심층 근거(deepdive)\n{_fmt_evidence(evidence or [])}"
+        if deepdive
+        else ""
+    )
+    deepdive_instr = (
+        " 이번은 deepdive 요청이다. 상위 섹터 각각을 별도 문단으로 깊게 분석하라: "
+        "전달 메커니즘·시차(lead/lag)·근거 id 를 명시하고 반례/리스크도 함께 짚어라."
+        if deepdive
+        else ""
+    )
     sys = _sys(
         "briefing_synthesizer",
-        "너는 최종 브리핑 합성가다. 제안형·중립 어조로 작성한다.",
+        "너는 최종 브리핑 합성가다. 제안형·중립 어조로 작성하며, 단정·종목 추천을 하지 않는다.",
         f"설명 깊이: {depth}\n# 지표\n{_fmt_metrics(macro_data)}\n"
         f"# 전이\n{json.dumps(transitions, ensure_ascii=False)}\n"
         f"# 랭킹\n{json.dumps(ranking, ensure_ascii=False)}\n"
         f"# 코인(분리)\n{json.dumps(coins, ensure_ascii=False)}\n"
-        f"# 전환신호\n{json.dumps(changes, ensure_ascii=False)}{insufficient_note}",
+        f"# 전환신호\n{json.dumps(changes, ensure_ascii=False)}{deepdive_ctx}{insufficient_note}",
         "다음 구획으로 한국어 브리핑을 작성하라: [결론] 한 줄, [근거] 지표→메커니즘→섹터, "
         "[주의] 워치포인트, [전환] 직전 대비 변화, [코인] 섹터와 분리한 영향. "
-        f"수치는 제공된 지표에서만 인용하라. 마지막 줄에 반드시 면책 문구를 포함하라: '{DISCLAIMER}'",
+        "수치는 제공된 지표에서만 인용하라(창작 금지). 위 전이/랭킹/코인에 없는 섹터·코인을 새로 단정하지 마라."
+        f"{deepdive_instr} "
+        f"마지막 줄에 반드시 면책 문구를 포함하라: '{DISCLAIMER}'",
         "자유 텍스트(마크다운 허용). 면책 문구 누락 금지.",
     )
     return [sys, {"role": "user", "content": "위 분석을 종합해 브리핑을 작성하라."}]

@@ -18,6 +18,13 @@ _METRICS: dict[str, Metric] = {
     "USDKRW": {"code": "USDKRW", "value": 1545.0, "unit": "KRW",
                "source": {"title": "USDKRW", "url": "https://example/fx", "ref": "news/2026-06-30.md", "published_at": "2026-06-29"},
                "observed_at": "2026-06-30"},
+    # 코인 실시세 fixture(섹터와 분리). data 레이어 실수집 전까지 그래프 코인 경로를 결정적으로 행사.
+    "BTC": {"code": "BTC", "value": 61000.0, "unit": "USD",
+            "source": {"title": "BTC", "url": "https://example/btc", "ref": "news/2026-06-30.md", "published_at": "2026-06-30"},
+            "observed_at": "2026-06-30"},
+    "ETH": {"code": "ETH", "value": 3400.0, "unit": "USD",
+            "source": {"title": "ETH", "url": "https://example/eth", "ref": "news/2026-06-30.md", "published_at": "2026-06-30"},
+            "observed_at": "2026-06-30"},
 }
 
 _EVIDENCE: list[Evidence] = [

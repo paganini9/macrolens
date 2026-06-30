@@ -160,3 +160,43 @@ def test_determinism_same_input_same_path():
     sig_a = [(e["type"], e.get("stage"), e.get("kind")) for e in a]
     sig_b = [(e["type"], e.get("stage"), e.get("kind")) for e in b]
     assert sig_a == sig_b
+
+
+# --- 실시간 토큰 스트리밍 (LLM v1.1) ----------------------------------------
+def test_streaming_emits_multiple_live_token_events():
+    events = _run("FOMC 발표 후 한국 섹터 점검")
+    tokens = [e for e in events if e["type"] == "token"]
+    # 줄 단위 1~5조각이 아니라 ~12자 델타 다수(실 토큰 스트리밍 입증).
+    assert len(tokens) > 5
+    body = _body(events)
+    assert "[결론]" in body
+    assert "투자 권유가 아니" in body  # 면책 강제(AC-G2)
+
+
+def test_streaming_event_order_sections_then_tokens_then_sources_then_done():
+    events = _run("FOMC 발표 후 한국 섹터 점검")
+    types = [e["type"] for e in events]
+    last_section = max(i for i, t in enumerate(types) if t == "section")
+    first_token = min(i for i, t in enumerate(types) if t == "token")
+    last_token = max(i for i, t in enumerate(types) if t == "token")
+    sources_idx = max(i for i, t in enumerate(types) if t == "sources")
+    # status* → section* → token* → sources → done
+    assert last_section < first_token
+    assert last_token < sources_idx
+    assert types[-1] == "done"
+
+
+def test_streaming_token_sequence_is_deterministic():
+    a = [e["text"] for e in _run("FOMC 발표 후 한국 섹터 점검") if e["type"] == "token"]
+    b = [e["text"] for e in _run("FOMC 발표 후 한국 섹터 점검") if e["type"] == "token"]
+    assert a == b and len(a) > 1
+
+
+# --- deepdive 라우팅 (3원칙 보존: 완전성·배타성·종료) ------------------------
+def test_deepdive_routes_through_full_analysis():
+    events = _run("반도체 섹터를 자세히 딥다이브 해줘", intent="deepdive")
+    section_kinds = {e["kind"] for e in events if e["type"] == "section"}
+    # whatif 와 달리 전체 분석 경로(전이·랭킹·코인·전환)를 그대로 탄다(라우팅 불변).
+    assert {"sector", "ranking", "coin", "change"} <= section_kinds
+    assert events[-1]["type"] == "done"
+    assert "투자 권유가 아니" in _body(events)

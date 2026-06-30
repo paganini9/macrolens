@@ -28,6 +28,25 @@ def test_mock_safety_blocks_trade_question():
     assert llm.generate(msgs, schema=schemas.SAFETY_SCHEMA)["decision"] == "block"
 
 
+# --- MockLLM.stream (LLM v1.1): generate 텍스트를 동일·결정적으로 청크 ---
+def test_mock_stream_reconstructs_generate_text_and_is_deterministic():
+    llm = MockLLM()
+    msgs = [
+        {"role": "system", "content": "[NODE:briefing_synthesizer]"},
+        {"role": "user", "content": "FOMC 후 섹터 점검"},
+    ]
+    full = llm.generate(msgs)
+    chunks = list(llm.stream(msgs))
+    assert len(chunks) > 1  # 작은 델타 다수
+    assert "".join(chunks) == full  # 무손실 복원
+    assert list(llm.stream(msgs)) == chunks  # 재현성
+
+
+def test_mock_has_stream_capability():
+    # GraphApp 능력 탐지(hasattr) 가 의존하는 v1.1 옵션 메서드 존재.
+    assert callable(getattr(MockLLM(), "stream", None))
+
+
 # --- SolarProvider: OpenAI 호환 호출 매핑(주입 client) ---
 class _FakeMessage:
     def __init__(self, content):
@@ -82,6 +101,50 @@ def test_solar_structured_parses_json():
         temperature=0.0,
     )
     assert out == {"intent": "whatif"}
+
+
+class _FakeDelta:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeStreamChoice:
+    def __init__(self, content):
+        self.delta = _FakeDelta(content)
+
+
+class _FakeStreamChunk:
+    def __init__(self, content):
+        self.choices = [_FakeStreamChoice(content)]
+
+
+class _FakeStreamCompletions:
+    def __init__(self, parts):
+        self._parts = parts
+        self.last_kwargs = None
+
+    def create(self, **kwargs):
+        self.last_kwargs = kwargs
+        return iter(_FakeStreamChunk(p) for p in self._parts)
+
+
+class _FakeStreamChat:
+    def __init__(self, parts):
+        self.completions = _FakeStreamCompletions(parts)
+
+
+class _FakeStreamClient:
+    def __init__(self, parts):
+        self.chat = _FakeStreamChat(parts)
+
+
+def test_solar_stream_yields_deltas():
+    parts = ["강달러", "·고금리 ", "요약", None]  # None 델타는 건너뛴다
+    client = _FakeStreamClient(parts)
+    llm = SolarProvider(client=client)
+    out = list(llm.stream([{"role": "user", "content": "요약"}], temperature=0.0))
+    assert out == ["강달러", "·고금리 ", "요약"]
+    assert client.chat.completions.last_kwargs["stream"] is True
 
 
 def test_solar_missing_key_raises_friendly():

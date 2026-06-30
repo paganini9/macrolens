@@ -15,6 +15,7 @@ from typing import Iterator
 from app.core.exceptions import AppError
 from app.core.logging import get_logger
 from app.core.types import Source
+from app.llm import prompts
 
 from .nodes import Nodes
 from .state import MAX_RETRIEVAL_ROUNDS, MacroLensState
@@ -112,7 +113,7 @@ def build_graph(
     g.add_edge("briefing_synthesizer", END)
 
     compiled = g.compile()
-    return GraphApp(compiled)
+    return GraphApp(compiled, llm=llm)
 
 
 # --- GraphApp (stream 계약) -------------------------------------------------
@@ -138,10 +139,16 @@ def _source_items(sources: list[Source]) -> list[dict]:
 
 
 class GraphApp:
-    """compiled LangGraph 를 감싸 SSE 이벤트 스트림으로 노출한다."""
+    """compiled LangGraph 를 감싸 SSE 이벤트 스트림으로 노출한다.
 
-    def __init__(self, compiled) -> None:
+    최종 합성은 분석 그래프 완주(결정적 structured 노드) 후 ``llm.stream()`` 으로
+    토큰을 **실시간** 산출한다(LLM v1.1). stream 미지원 provider·근거부족·가드레일·합성장애
+    경로는 기존처럼 템플릿 본문을 줄 단위로 청크한다(후방호환).
+    """
+
+    def __init__(self, compiled, llm=None) -> None:
         self._compiled = compiled
+        self._llm = llm
 
     def stream(self, state_in: MacroLensState) -> Iterator[dict]:
         merged: dict = dict(state_in)
@@ -188,12 +195,63 @@ class GraphApp:
         elif node == "briefing_synthesizer":
             yield {"type": "status", "stage": "synthesize", "msg": "브리핑 합성"}
             briefing = delta.get("briefing") or {}
-            body = briefing.get("body", "")
-            for line in _chunk_text(body):
-                yield {"type": "token", "text": line}
+            yield from self._emit_briefing_tokens(briefing, merged)
             items = _source_items(merged.get("sources", []))
             if items:
                 yield {"type": "sources", "items": items}
+
+    # --- 브리핑 토큰 emit (실시간 stream 우선, 폴백=청크) ---
+    def _emit_briefing_tokens(self, briefing: dict, merged: dict) -> Iterator[dict]:
+        body = briefing.get("body", "")
+        if self._is_live_streamable(briefing, merged):
+            try:
+                emitted: list[str] = []
+                for delta_text in self._llm.stream(self._briefing_messages(merged), temperature=0.2):
+                    if not delta_text:
+                        continue
+                    emitted.append(delta_text)
+                    yield {"type": "token", "text": delta_text}
+                streamed = "".join(emitted)
+                # 면책 강제(AC-G2): 실시간 스트림에 누락되면 마지막 토큰으로 보강.
+                if streamed.strip() and prompts.DISCLAIMER not in streamed:
+                    yield {"type": "token", "text": f"\n\n{prompts.DISCLAIMER}"}
+                if streamed.strip():
+                    return
+            except Exception:  # pragma: no cover - 방어: 스트림 실패 시 청크 폴백
+                logger.warning("live token stream failed; falling back to chunked body")
+        # 폴백: 저장된 본문을 줄 단위로 청크(기존 동작 = 후방호환).
+        for line in _chunk_text(body):
+            yield {"type": "token", "text": line}
+
+    def _is_live_streamable(self, briefing: dict, merged: dict) -> bool:
+        """정상 LLM 합성 경로에서만 실시간 스트림(근거부족·합성장애·가드레일·미지원 provider 제외)."""
+        if not callable(getattr(self._llm, "stream", None)):
+            return False
+        if merged.get("blocked"):
+            return False
+        insufficient = (not merged.get("data_sufficient", True)) or (not merged.get("rag_context"))
+        if insufficient:
+            return False
+        body = briefing.get("body", "")
+        if body.lstrip().startswith("[안내]"):  # 합성 LLM 장애 폴백 본문
+            return False
+        return bool(body)
+
+    def _briefing_messages(self, merged: dict) -> list[dict]:
+        """node 와 동일 인자로 briefing 프롬프트 재구성(실시간 합성 스트림용)."""
+        deepdive = merged.get("intent") == "deepdive"
+        depth = "background" if deepdive else merged.get("depth", "evidence")
+        return prompts.briefing_messages(
+            merged.get("macro_data", {}),
+            merged.get("transitions", []),
+            merged.get("sector_ranking", []),
+            merged.get("coin_mapping", []),
+            merged.get("changes", []),
+            depth,
+            insufficient=False,
+            deepdive=deepdive,
+            evidence=merged.get("rag_context", []),
+        )
 
     def _done_event(self, merged: dict) -> dict:
         briefing = merged.get("briefing") or {}

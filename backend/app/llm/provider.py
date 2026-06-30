@@ -1,18 +1,24 @@
-"""LLM provider 추상화 (interface_contracts v1 §4).
+"""LLM provider 추상화 (interface_contracts v1 §4 + v1.1 additive 확장).
 
-`LLM` 계약: generate(messages, schema=None, temperature=0.2, max_tokens=1024)
+`LLM` 계약(v1, 불변): generate(messages, schema=None, temperature=0.2, max_tokens=1024)
   - schema 지정 시 structured output(dict), 없으면 자유 텍스트(str).
+
+`LLM` v1.1 (ADDITIVE, **선택적**): stream(messages, temperature=0.2, max_tokens=1024) -> Iterator[str]
+  - 자유 텍스트(최종 합성)를 토큰 델타로 점진 산출한다. schema 없음(분기/추출 노드는 generate 사용).
+  - 후방호환: generate 시그니처·동작은 그대로다. stream 미보유 provider 도 정상 동작해야 하므로
+    소비자(GraphApp)는 ``hasattr(llm, "stream")`` 로 능력을 탐지한다(Protocol 필수 메서드 아님).
+  - Change Control 대상: 프리즈된 contracts/ 파일은 수정하지 않고 본 모듈 docstring 에만 기록한다.
 
 구현:
   - ClaudeProvider : anthropic SDK 사용. settings.anthropic_api_key 없으면 친절한 오류.
-  - SolarProvider  : Upstage Solar 스텁(미구현 표시).
-  - MockLLM        : 테스트용 결정적 출력(키워드/스키마 기반).
+  - SolarProvider  : Upstage Solar(OpenAI 호환). chat.completions stream=True 로 델타 산출.
+  - MockLLM        : 테스트용 결정적 출력(키워드/스키마 기반). stream 은 generate 텍스트를 동일하게 청크.
   - get_llm()      : settings.llm_provider 팩토리.
 """
 from __future__ import annotations
 
 import json
-from typing import Protocol, runtime_checkable
+from typing import Iterator, Protocol, runtime_checkable
 
 from app.core.config import settings
 from app.core.exceptions import LLMError
@@ -150,6 +156,36 @@ class ClaudeProvider:
             return _parse_json(text)
         return text
 
+    def stream(
+        self,
+        messages: list[dict],
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[str]:
+        """LLM v1.1: 최종 합성 텍스트를 토큰 델타로 점진 산출(자유 텍스트, schema 없음)."""
+        client = self._ensure_client()
+        system, chat = _extract_system(messages)
+        kwargs: dict = {
+            "model": self._model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": chat,
+        }
+        if system:
+            kwargs["system"] = system
+        try:
+            with client.messages.stream(**kwargs) as s:
+                for text in s.text_stream:
+                    if text:
+                        yield text
+        except LLMError:
+            raise
+        except Exception as e:  # pragma: no cover - 네트워크/SDK 오류
+            raise LLMError(
+                "LLM 스트리밍 호출에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+                internal_detail=f"{type(e).__name__}: {e}",
+            ) from e
+
 
 class SolarProvider:
     """Upstage Solar provider (LLM_PROVIDER=solar). OpenAI 호환 chat completions.
@@ -215,6 +251,34 @@ class SolarProvider:
             return _parse_json(text)
         return text
 
+    def stream(
+        self,
+        messages: list[dict],
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[str]:
+        """LLM v1.1: OpenAI 호환 chat.completions(stream=True) 델타를 그대로 yield."""
+        client = self._ensure_client()
+        try:
+            resp = client.chat.completions.create(
+                model=self._model,
+                messages=list(messages),
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            for chunk in resp:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+        except LLMError:
+            raise
+        except Exception as e:  # pragma: no cover - 네트워크/SDK 오류
+            raise LLMError(
+                "LLM 스트리밍 호출에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+                internal_detail=f"{type(e).__name__}: {e}",
+            ) from e
+
 
 class MockLLM:
     """테스트용 결정적 LLM.
@@ -260,6 +324,21 @@ class MockLLM:
             return handler(user_text)
         # 스키마 없으면 자유 텍스트, 있으면 빈 dict 방어
         return {} if schema is not None else "MOCK_RESPONSE"
+
+    def stream(
+        self,
+        messages: list[dict],
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[str]:
+        """LLM v1.1: generate 와 **동일한** 결정적 텍스트를 작은 청크로 분할해 yield.
+
+        재현성: 같은 입력 → 같은 청크 시퀀스(회귀/스트리밍 테스트가 의존).
+        """
+        text = self.generate(messages, schema=None, temperature=temperature, max_tokens=max_tokens)
+        if not isinstance(text, str):  # 방어: 스키마 없는 호출이므로 보통 str
+            text = json.dumps(text, ensure_ascii=False)
+        yield from _mock_stream_chunks(text)
 
     # --- tag 판별 (프롬프트 내 식별 표지 또는 키워드) ---
     @staticmethod
@@ -373,6 +452,13 @@ class MockLLM:
             "[코인] BTC는 섹터와 분리해 보면 유동성 위축에 약세 편향.\n"
             "본 자료는 투자 권유가 아니며 판단 재료를 제공합니다."
         )
+
+
+def _mock_stream_chunks(text: str, size: int = 12) -> list[str]:
+    """결정적 토큰 스트리밍 흉내: 고정 길이(~12자) 청크로 분할. join 시 원문 복원."""
+    if not text:
+        return []
+    return [text[i : i + size] for i in range(0, len(text), size)]
 
 
 def get_llm(provider: str | None = None) -> LLM:
