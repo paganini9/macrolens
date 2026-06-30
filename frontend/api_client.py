@@ -107,6 +107,61 @@ class BriefingState:
             self.changes = payload.get("changes", []) or self.changes
 
 
+# --- 차트/히스토리 변환 (순수) ---------------------------------------------
+# 강도→크기, 방향→부호. 색은 방향(상승/하락/중립)에만 절제해 매핑한다.
+_STRENGTH_MAGNITUDE = {"high": 1.0, "medium": 0.6, "low": 0.3}
+_DIRECTION_SIGN = {"positive": 1, "negative": -1, "neutral": 0}
+_DIRECTION_LABEL = {"positive": "상승", "negative": "하락", "neutral": "중립"}
+
+
+def transition_chart_rows(transitions: Iterable[dict]) -> list[dict]:
+    """섹터 전이 리스트 → 막대차트용 행 리스트.
+
+    value = 방향부호(±1/0) × 강도크기(high 1.0/medium 0.6/low 0.3).
+    각 행: {'sector', 'value', 'direction', 'direction_label'}.
+    """
+    rows: list[dict] = []
+    for t in transitions:
+        direction = t.get("direction", "neutral")
+        magnitude = _STRENGTH_MAGNITUDE.get(t.get("strength", ""), 0.5)
+        value = round(_DIRECTION_SIGN.get(direction, 0) * magnitude, 3)
+        rows.append({
+            "sector": t.get("sector", ""),
+            "value": value,
+            "direction": direction,
+            "direction_label": _DIRECTION_LABEL.get(direction, "중립"),
+        })
+    return rows
+
+
+def ranking_chart_rows(ranking: Iterable[dict]) -> list[dict]:
+    """성장 랭킹 리스트 → 점수 내림차순 막대차트용 행 리스트({'sector','score'})."""
+    rows = [
+        {"sector": r.get("sector", ""), "score": float(r.get("score", 0) or 0)}
+        for r in ranking
+    ]
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return rows
+
+
+def make_history_entry(state: "BriefingState", query: str, ts: str) -> dict:
+    """완료된 브리핑을 세션 히스토리 항목으로 요약(순수).
+
+    백엔드 신규 엔드포인트 없이 세션에만 보관하기 위한 경량 스냅샷.
+    """
+    summary = state.summary or (state.error or {}).get("user_message", "") or "(요약 없음)"
+    title = (query or "브리핑").strip() or "브리핑"
+    if len(title) > 40:
+        title = title[:39] + "…"
+    return {
+        "ts": ts,
+        "title": title,
+        "summary": summary,
+        "is_error": state.error is not None,
+        "state": state,
+    }
+
+
 # --- HTTP 클라이언트 --------------------------------------------------------
 class MacroLensClient:
     def __init__(self, base_url: str, timeout: float = 60.0):

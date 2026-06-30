@@ -1,7 +1,13 @@
 """api_client 순수 로직 테스트 (SSE 파싱·이벤트 누적). Streamlit 비의존."""
 from __future__ import annotations
 
-from api_client import BriefingState, iter_sse_events
+from api_client import (
+    BriefingState,
+    iter_sse_events,
+    make_history_entry,
+    ranking_chart_rows,
+    transition_chart_rows,
+)
 
 SAMPLE = [
     "event: status",
@@ -73,3 +79,46 @@ def test_briefing_state_error():
     state.apply({"type": "error", "code": "LLM_ERROR", "user_message": "일시적 오류", "trace_id": "z"})
     assert state.error["code"] == "LLM_ERROR"
     assert state.error["user_message"] == "일시적 오류"
+
+
+def test_transition_chart_rows_signs_and_magnitude():
+    rows = transition_chart_rows([
+        {"sector": "반도체", "direction": "negative", "strength": "high"},
+        {"sector": "AI/SW", "direction": "positive", "strength": "medium"},
+        {"sector": "금융", "direction": "neutral", "strength": "low"},
+        {"sector": "자동차", "direction": "positive"},  # 강도 누락 → 기본 0.5
+    ])
+    by_sector = {r["sector"]: r for r in rows}
+    assert by_sector["반도체"]["value"] == -1.0
+    assert by_sector["AI/SW"]["value"] == 0.6
+    assert by_sector["금융"]["value"] == 0.0  # neutral → 부호 0
+    assert by_sector["자동차"]["value"] == 0.5
+    assert by_sector["반도체"]["direction_label"] == "하락"
+
+
+def test_ranking_chart_rows_sorted_desc():
+    rows = ranking_chart_rows([
+        {"sector": "A", "score": 0.3},
+        {"sector": "B", "score": 0.9},
+        {"sector": "C", "score": None},  # None → 0.0 방어
+    ])
+    assert [r["sector"] for r in rows] == ["B", "A", "C"]
+    assert rows[-1]["score"] == 0.0
+
+
+def test_make_history_entry_summary_and_truncation():
+    state = BriefingState()
+    state.summary = "한 줄 결론"
+    entry = make_history_entry(state, "x" * 50, ts="2026-07-01 09:00")
+    assert entry["summary"] == "한 줄 결론"
+    assert entry["is_error"] is False
+    assert len(entry["title"]) == 40 and entry["title"].endswith("…")
+    assert entry["state"] is state
+
+
+def test_make_history_entry_uses_error_message():
+    state = BriefingState()
+    state.error = {"user_message": "백엔드 연결 실패", "code": "NETWORK", "trace_id": ""}
+    entry = make_history_entry(state, "질문", ts="2026-07-01 09:00")
+    assert entry["is_error"] is True
+    assert entry["summary"] == "백엔드 연결 실패"

@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     fred_api_key: str = ""
     ecos_api_key: str = ""
     fmp_api_key: str = ""
+    logfire_token: str = ""  # 설정 시에만 Logfire 관측성 활성(없으면 no-op)
     rag_corpus_dir: str = "./rag_corpus"
     chroma_dir: str = "./.chroma"
     sqlite_path: str = "./macrolens.db"

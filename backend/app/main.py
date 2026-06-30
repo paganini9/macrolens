@@ -15,6 +15,7 @@ from .api.routes import router
 from .core.config import settings
 from .core.exceptions import AppError
 from .core.logging import configure_logging, get_logger
+from .core.observability import configure_observability
 
 configure_logging()
 log = get_logger("macrolens")
@@ -30,6 +31,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="MacroLens", version="0.1.0", lifespan=lifespan)
+configure_observability(app)  # Logfire 계측(토큰/패키지 없으면 no-op)
 app.include_router(router)
 
 
