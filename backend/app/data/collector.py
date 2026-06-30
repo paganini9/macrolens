@@ -13,12 +13,50 @@ from typing import Optional, Protocol, runtime_checkable
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.core.reliability import CircuitBreaker
 from app.core.types import Metric, Source
 from app.data import clients
 from app.data.cache import TTLCache
 from app.data.clients import FetchFn, _default_fetch
 
 logger = get_logger(__name__)
+
+# 코인은 섹터와 분리 표시되는 별도 지표군. 그래프 코인 노드가 이 상수를 참조한다.
+COIN_CODES: list[str] = ["BTC", "ETH"]
+
+# ---------------------------------------------------------------------------
+# 지표 클래스별 캐시 TTL(초). 갱신 주기에 맞춰 차등 적용(캐시 정책).
+#   - 금리(FFR/US10Y/KR_BASE): 일 단위로만 바뀜 → 24h.
+#   - 환율/지수(USDKRW/DXY): 장중 변동 → 1h.
+#   - 코인(BTC/ETH): 변동성 큼, 스팟 → 60s.
+# 그 외 미분류 지표는 보수적 기본값(6h).
+# ---------------------------------------------------------------------------
+TTL_RATES_S: float = 24 * 60 * 60
+TTL_FX_S: float = 60 * 60
+TTL_COIN_S: float = 60
+TTL_DEFAULT_S: float = 6 * 60 * 60
+
+INDICATOR_TTL_S: dict[str, float] = {
+    "FFR": TTL_RATES_S,
+    "US10Y": TTL_RATES_S,
+    "KR_BASE": TTL_RATES_S,
+    "USDKRW": TTL_FX_S,
+    "DXY": TTL_FX_S,
+    "BTC": TTL_COIN_S,
+    "ETH": TTL_COIN_S,
+}
+
+
+def ttl_for(code: str) -> float:
+    """지표 코드의 캐시 TTL(초). 미등록 코드는 보수적 기본값."""
+    return INDICATOR_TTL_S.get(code, TTL_DEFAULT_S)
+
+
+# 서킷 브레이커로 감싸는 소스. 무료 티어 FMP 가 반복 실패하면 차단 → 폴백(yfinance/coingecko).
+# 키리스 폴백(yfinance/coingecko)·키 필수 FRED/ECOS 는 폴백 자체가 신뢰성 경로라 미적용.
+BREAKER_SOURCES: frozenset[str] = frozenset({"fmp"})
+FMP_BREAKER_FAIL_MAX: int = 3
+FMP_BREAKER_RESET_S: float = 60.0
 
 
 @runtime_checkable
@@ -47,9 +85,12 @@ INDICATOR_SPECS: dict[str, list[tuple[str, dict]]] = {
         ("yfinance", {"symbol": "DX-Y.NYB", "unit": "index"}),
     ],
     "USDKRW": [
+        # ECOS 731Y001 / 0000001 = 원/미국달러(매매기준율), 일(D) 주기.
+        ("ecos", {"stat_code": "731Y001", "item_code": "0000001", "cycle": "D", "unit": "KRW"}),
         ("fred", {"series_id": "DEXKOUS", "unit": "KRW"}),
         ("yfinance", {"symbol": "KRW=X", "unit": "KRW"}),
     ],
+    # ECOS 722Y001 / 0101000 = 한국은행 기준금리, 월(M) 주기(ecos_latest 기본 cycle).
     "KR_BASE": [("ecos", {"stat_code": "722Y001", "item_code": "0101000", "unit": "%"})],
     "BTC": [
         ("fmp", {"symbol": "BTCUSD", "unit": "USD"}),
@@ -69,43 +110,84 @@ class LiveDataCollector:
         self,
         cache: Optional[TTLCache] = None,
         fetch: FetchFn = _default_fetch,
+        breaker_fail_max: int = FMP_BREAKER_FAIL_MAX,
+        breaker_reset_timeout: float = FMP_BREAKER_RESET_S,
     ) -> None:
         self._cache: TTLCache = cache or TTLCache()
         self._fetch = fetch
         self._gaps: list[str] = []
+        self._breaker_fail_max = breaker_fail_max
+        self._breaker_reset_timeout = breaker_reset_timeout
+        # 소스별 서킷 브레이커(지연 생성). BREAKER_SOURCES 만 대상.
+        self._breakers: dict[str, CircuitBreaker] = {}
+
+    def _breaker_for(self, source_name: str) -> Optional[CircuitBreaker]:
+        """브레이커 대상 소스면 (지연 생성한) CircuitBreaker 를, 아니면 None."""
+        if source_name not in BREAKER_SOURCES:
+            return None
+        breaker = self._breakers.get(source_name)
+        if breaker is None:
+            breaker = CircuitBreaker(
+                fail_max=self._breaker_fail_max,
+                reset_timeout=self._breaker_reset_timeout,
+            )
+            self._breakers[source_name] = breaker
+        return breaker
 
     # -- 소스 디스패치 --------------------------------------------------
-    def _call_source(self, code: str, source_name: str, params: dict) -> Optional[Metric]:
-        """단일 소스 호출. 적절한 클라이언트로 위임하고 Metric|None 반환."""
+    def _dispatch(self, code: str, source_name: str, params: dict) -> Optional[Metric]:
+        """소스명 → 클라이언트 위임. 알 수 없는 소스는 None."""
         unit = params.get("unit", "")
-        try:
-            if source_name == "fred":
-                return clients.fred_series(
-                    code, params["series_id"], unit,
-                    api_key=settings.fred_api_key, fetch=self._fetch,
-                )
-            if source_name == "ecos":
-                return clients.ecos_latest(
-                    code, params["stat_code"], params["item_code"], unit,
-                    api_key=settings.ecos_api_key, fetch=self._fetch,
-                )
-            if source_name == "fmp":
-                return clients.fmp_quote(
-                    code, params["symbol"], unit,
-                    api_key=settings.fmp_api_key, fetch=self._fetch,
-                )
-            if source_name == "yfinance":
-                # 키리스, 라이브러리 자체 네트워킹 → fetch 주입 대상 아님
-                return clients.yfinance_quote(code, params["symbol"], unit)
-            if source_name == "coingecko":
-                return clients.coingecko_price(
-                    code, params["coin_id"], unit, fetch=self._fetch,
-                )
-        except Exception as exc:  # noqa: BLE001 - 어떤 소스 오류도 gap 으로
-            logger.warning("소스 %s 호출 실패 %s: %s", source_name, code, exc)
-            return None
+        if source_name == "fred":
+            return clients.fred_series(
+                code, params["series_id"], unit,
+                api_key=settings.fred_api_key, fetch=self._fetch,
+            )
+        if source_name == "ecos":
+            return clients.ecos_latest(
+                code, params["stat_code"], params["item_code"], unit,
+                api_key=settings.ecos_api_key, cycle=params.get("cycle", "M"),
+                fetch=self._fetch,
+            )
+        if source_name == "fmp":
+            return clients.fmp_quote(
+                code, params["symbol"], unit,
+                api_key=settings.fmp_api_key, fetch=self._fetch,
+            )
+        if source_name == "yfinance":
+            # 키리스, 라이브러리 자체 네트워킹 → fetch 주입 대상 아님
+            return clients.yfinance_quote(code, params["symbol"], unit)
+        if source_name == "coingecko":
+            return clients.coingecko_price(
+                code, params["coin_id"], unit, fetch=self._fetch,
+            )
         logger.warning("알 수 없는 소스 %s (%s)", source_name, code)
         return None
+
+    def _call_source(self, code: str, source_name: str, params: dict) -> Optional[Metric]:
+        """단일 소스 호출. 서킷 브레이커로 보호하고 Metric|None 반환.
+
+        브레이커가 열려 있으면 호출 없이 즉시 None → 다음(폴백) 소스로 넘긴다.
+        실패(예외/None)는 record_failure, 성공은 record_success 로 브레이커에 반영.
+        """
+        breaker = self._breaker_for(source_name)
+        if breaker is not None and breaker.is_open:
+            logger.info("서킷 open: %s 건너뜀 → 폴백 (%s)", source_name, code)
+            return None
+        try:
+            metric = self._dispatch(code, source_name, params)
+        except Exception as exc:  # noqa: BLE001 - 어떤 소스 오류도 gap 으로
+            logger.warning("소스 %s 호출 실패 %s: %s", source_name, code, exc)
+            if breaker is not None:
+                breaker.record_failure()
+            return None
+        if metric is None:
+            if breaker is not None:
+                breaker.record_failure()
+            return None
+        if breaker is not None:
+            breaker.record_success()
+        return metric
 
     def _resolve(self, code: str) -> Optional[Metric]:
         """지표 1개를 소스 우선순위에 따라 폴백 시도. 성공 시 Metric, 실패 시 None."""
@@ -133,7 +215,8 @@ class LiveDataCollector:
             if metric is None:
                 self._gaps.append(code)
                 continue
-            self._cache.set(code, metric)
+            # 지표 클래스별 TTL 로 저장(금리 24h / 환율 1h / 코인 60s).
+            self._cache.set(code, metric, ttl=ttl_for(code))
             result[code] = metric
         return result
 
@@ -170,6 +253,17 @@ MOCK_METRICS: dict[str, Metric] = {
     "USDKRW": _fixture(
         "USDKRW", 1378.5, "KRW", "FRED DEXKOUS", "DEXKOUS",
         "https://fred.stlouisfed.org/series/DEXKOUS",
+        "2024-05-31", "2024-05-31",
+    ),
+    # 코인은 섹터와 분리 표시. 키리스 CoinGecko 픽스처(명백히 'mock').
+    "BTC": _fixture(
+        "BTC", 65000.0, "USD", "CoinGecko bitcoin", "bitcoin",
+        "https://www.coingecko.com/en/coins/bitcoin",
+        "2024-05-31", "2024-05-31",
+    ),
+    "ETH": _fixture(
+        "ETH", 3200.0, "USD", "CoinGecko ethereum", "ethereum",
+        "https://www.coingecko.com/en/coins/ethereum",
         "2024-05-31", "2024-05-31",
     ),
 }

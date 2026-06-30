@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from app.data.collector import (
+    COIN_CODES,
     DataCollector,
     LiveDataCollector,
     MockDataCollector,
@@ -13,6 +14,7 @@ from app.data.collector import (
 )
 
 __all__ = [
+    "COIN_CODES",
     "DataCollector",
     "LiveDataCollector",
     "MockDataCollector",

@@ -3,12 +3,14 @@ from __future__ import annotations
 
 from app.core.types import Metric
 from app.data import (
+    COIN_CODES,
     DataCollector,
     LiveDataCollector,
     MockDataCollector,
     get_collector,
 )
 from app.data.cache import TTLCache
+from app.data.collector import TTL_COIN_S, TTL_RATES_S, ttl_for
 
 METRIC_KEYS = {"code", "value", "unit", "source", "observed_at"}
 SOURCE_KEYS = {"title", "url", "ref", "published_at"}
@@ -37,6 +39,39 @@ def test_mock_reports_gap_for_unknown_indicator():
     out = c.collect(["US"], ["FFR", "UNKNOWN_X"])
     assert set(out.keys()) == {"FFR"}
     assert c.gaps() == ["UNKNOWN_X"]
+
+
+def test_mock_returns_coin_metrics():
+    # 코인(BTC/ETH)은 섹터와 분리된 별도 지표. Mock 도 결정적 픽스처를 제공.
+    c = MockDataCollector()
+    out = c.collect(["US", "KR"], COIN_CODES)
+    assert set(out.keys()) == {"BTC", "ETH"}
+    for m in out.values():
+        _assert_metric_shape(m)
+        assert m["unit"] == "USD"
+    assert out["BTC"]["value"] == 65000.0
+    assert out["ETH"]["value"] == 3200.0
+    assert c.gaps() == []
+
+
+def test_mock_mixes_macro_and_coin_codes():
+    # collect 계약이 거시 코드와 코인 코드를 함께 받아 처리하는지 확인.
+    c = MockDataCollector()
+    out = c.collect(["US"], ["FFR", "BTC", "UNKNOWN_X"])
+    assert set(out.keys()) == {"FFR", "BTC"}
+    assert c.gaps() == ["UNKNOWN_X"]
+
+
+def test_coin_codes_export():
+    assert COIN_CODES == ["BTC", "ETH"]
+
+
+def test_ttl_policy_per_indicator_class():
+    # 금리는 길게, 코인은 짧게. 캐시 정책이 클래스별로 차등 적용되는지.
+    assert ttl_for("FFR") == TTL_RATES_S
+    assert ttl_for("BTC") == TTL_COIN_S
+    assert ttl_for("ETH") == TTL_COIN_S
+    assert ttl_for("FFR") > ttl_for("BTC")
 
 
 def test_mock_satisfies_protocol():
