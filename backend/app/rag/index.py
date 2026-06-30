@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import threading
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -43,7 +44,10 @@ class Ledger:
     def __init__(self, db_path: str):
         self.db_path = db_path
         os.makedirs(os.path.dirname(os.path.abspath(db_path)) or ".", exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
+        # API 가 그래프를 threadpool 에서 실행하므로(lifespan 인덱싱 ↔ 요청 쿼리 스레드 상이)
+        # 단일 연결을 스레드 간 공유한다. 쓰기 직렬화는 _lock 으로 보호.
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._lock = threading.Lock()
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS rag_ledger (
@@ -76,17 +80,18 @@ class Ledger:
         }
 
     def upsert(self, doc_id: str, path: str, hash_: str, collection: str, chunk_ids: list[str]) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO rag_ledger(doc_id, path, hash, model_version, collection, chunk_ids)
-            VALUES (?,?,?,?,?,?)
-            ON CONFLICT(doc_id) DO UPDATE SET
-                path=excluded.path, hash=excluded.hash, model_version=excluded.model_version,
-                collection=excluded.collection, chunk_ids=excluded.chunk_ids
-            """,
-            (doc_id, path, hash_, EMBED_MODEL_VERSION, collection, ",".join(chunk_ids)),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO rag_ledger(doc_id, path, hash, model_version, collection, chunk_ids)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(doc_id) DO UPDATE SET
+                    path=excluded.path, hash=excluded.hash, model_version=excluded.model_version,
+                    collection=excluded.collection, chunk_ids=excluded.chunk_ids
+                """,
+                (doc_id, path, hash_, EMBED_MODEL_VERSION, collection, ",".join(chunk_ids)),
+            )
+            self._conn.commit()
 
     def all_doc_ids(self) -> set[str]:
         cur = self._conn.execute("SELECT doc_id FROM rag_ledger")
@@ -94,8 +99,9 @@ class Ledger:
 
     def delete(self, doc_id: str) -> Optional[dict[str, Any]]:
         prev = self.get(doc_id)
-        self._conn.execute("DELETE FROM rag_ledger WHERE doc_id=?", (doc_id,))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("DELETE FROM rag_ledger WHERE doc_id=?", (doc_id,))
+            self._conn.commit()
         return prev
 
     def close(self) -> None:
