@@ -29,7 +29,7 @@ logger = get_logger(__name__)
 # 계약 기본값 (한 곳에서 관리)
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_TOKENS = 1024
-DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-latest"
+DEFAULT_MODEL_CLAUDE = "claude-sonnet-4-6"  # 현행 모델(구 claude-3-5-sonnet-latest 는 404)
 # Solar(Upstage) — OpenAI 호환 chat completions (참고_solar_upstage.md)
 DEFAULT_MODEL_SOLAR = "solar-pro3"
 SOLAR_BASE_URL = "https://api.upstage.ai/v1"
