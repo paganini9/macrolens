@@ -208,71 +208,41 @@ class Nodes:
 
     # --- 12. 브리핑 합성 ---
     def briefing_synthesizer(self, state: MacroLensState) -> dict:
+        """브리핑 본문 결정. 영속화·실시간 토큰은 GraphApp 이 담당한다.
+
+        - 근거 부족: LLM 없이 결정적 '근거 부족' 안내(AC-A3, 환각 0).
+        - 정상 + provider 가 stream 지원: 본문 생성을 GraphApp 스트리밍에 위임(``_deferred``).
+          → 합성 LLM 은 **1회만**(스트림) 호출된다(이전 generate+stream 2회 → 1회).
+        - 정상 + 비스트리밍 provider: 여기서 1회 generate.
+        """
         insufficient = not state.get("data_sufficient", True) or not state.get("rag_context")
-        # 데이터/근거 부족 시 LLM 호출 없이 결정적 '근거 부족' 안내(AC-A3, 단정 금지·환각 0).
         if insufficient:
             text = prompts.INSUFFICIENT_BRIEFING.format(disclaimer=prompts.DISCLAIMER)
-            return self._finalize_briefing(state, text)
-        # deepdive 의도면 섹터 심층(depth=background) + 근거 상세 주입(라우팅은 불변).
-        deepdive = state.get("intent") == "deepdive"
-        depth = "background" if deepdive else state.get("depth", "evidence")
+            return {"briefing": build_briefing(state, text)}
+        if callable(getattr(self.llm, "stream", None)):
+            scaffold = build_briefing(state, "")   # 본문은 GraphApp 스트리밍으로 채움
+            scaffold["_deferred"] = True
+            return {"briefing": scaffold}
+        # 비스트리밍 provider: 단일 generate.
         try:
-            text = self.llm.generate(
-                prompts.briefing_messages(
-                    state.get("macro_data", {}),
-                    state.get("transitions", []),
-                    state.get("sector_ranking", []),
-                    state.get("coin_mapping", []),
-                    state.get("changes", []),
-                    depth,
-                    insufficient=insufficient,
-                    deepdive=deepdive,
-                    evidence=state.get("rag_context", []),
-                ),
-                temperature=0.2,
-            )
+            text = self.llm.generate(briefing_prompt(state), temperature=0.2)
             if isinstance(text, dict):  # 방어
                 text = str(text)
         except AppError as e:
-            # LLM 장애 시에도 사용자에게 면책 포함 안내를 제공(부분 결과 + 재시도 안내).
-            note = _err("briefing_synthesizer", e)
-            text = (
-                "[안내] 브리핑 합성 중 일시적 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.\n"
-                f"\n{prompts.DISCLAIMER}"
-            )
-            fallback: BriefingResult = {
-                "thread_id": state["thread_id"],
-                "conclusion": "일시적 오류로 브리핑을 완성하지 못했습니다.",
-                "body": text,
-                "sectors": state.get("transitions", []),
-                "coins": state.get("coin_mapping", []),
-                "changes": state.get("changes", []),
-                "disclaimer": prompts.DISCLAIMER,
-            }
-            return {"briefing": fallback, "errors": [note]}
-        return self._finalize_briefing(state, text)
+            fail = prompts.SYNTH_FAILURE_BRIEFING.format(disclaimer=prompts.DISCLAIMER)
+            return {"briefing": build_briefing(state, fail), "errors": [_err("briefing_synthesizer", e)]}
+        return {"briefing": build_briefing(state, text)}
 
-    def _finalize_briefing(self, state: MacroLensState, text: str) -> dict:
-        """면책 강제(AC-G2) + BriefingResult 구성 + 영속화(전환 탐지 기준)."""
-        if prompts.DISCLAIMER not in text:
-            text = f"{text.rstrip()}\n\n{prompts.DISCLAIMER}"
-        briefing: BriefingResult = {
-            "thread_id": state["thread_id"],
-            "conclusion": _first_line(text),
-            "body": text,
-            "sectors": state.get("transitions", []),
-            "coins": state.get("coin_mapping", []),
-            "changes": state.get("changes", []),
-            "disclaimer": prompts.DISCLAIMER,
-        }
-        if self.store:
-            try:
-                payload = dict(briefing)
-                payload["trigger_type"] = state.get("trigger_type")
-                self.store.save_briefing(state["thread_id"], payload)
-            except AppError as e:
-                return {"briefing": briefing, "errors": [_err("briefing_synthesizer.save", e)]}
-        return {"briefing": briefing}
+    def persist_briefing(self, state: MacroLensState, briefing: dict) -> None:
+        """최종 브리핑을 스토어에 영속화(전환 탐지 기준). 실패는 삼켜 스트림을 끊지 않는다."""
+        if not self.store:
+            return
+        try:
+            payload = {k: v for k, v in briefing.items() if k != "_deferred"}
+            payload["trigger_type"] = state.get("trigger_type")
+            self.store.save_briefing(state["thread_id"], payload)
+        except AppError as e:  # 저장 실패해도 사용자에겐 브리핑을 유지
+            logger.warning("briefing persist failed: %s", getattr(e, "internal_detail", e))
 
 
 def _first_line(text: str) -> str:
@@ -284,3 +254,41 @@ def _first_line(text: str) -> str:
                 s = s.split("]", 1)[1].strip()
             return s
     return text.strip()[:120]
+
+
+def briefing_prompt(state: MacroLensState) -> list[dict]:
+    """브리핑 합성 프롬프트(노드·GraphApp 공용, 정상 경로 전용).
+
+    deepdive 의도면 섹터 심층(depth=background) + 근거 상세 주입(라우팅 불변).
+    """
+    deepdive = state.get("intent") == "deepdive"
+    depth = "background" if deepdive else state.get("depth", "evidence")
+    return prompts.briefing_messages(
+        state.get("macro_data", {}),
+        state.get("transitions", []),
+        state.get("sector_ranking", []),
+        state.get("coin_mapping", []),
+        state.get("changes", []),
+        depth,
+        insufficient=False,
+        deepdive=deepdive,
+        evidence=state.get("rag_context", []),
+    )
+
+
+def build_briefing(state: MacroLensState, text: str) -> BriefingResult:
+    """면책 강제(AC-G2) + BriefingResult 구성(영속화는 GraphApp).
+
+    text='' 이면 스트리밍 대기 스캐폴드(conclusion·body 비움) — GraphApp 이 본문을 채운다.
+    """
+    if text and prompts.DISCLAIMER not in text:
+        text = f"{text.rstrip()}\n\n{prompts.DISCLAIMER}"
+    return {
+        "thread_id": state["thread_id"],
+        "conclusion": _first_line(text) if text else "",
+        "body": text,
+        "sectors": state.get("transitions", []),
+        "coins": state.get("coin_mapping", []),
+        "changes": state.get("changes", []),
+        "disclaimer": prompts.DISCLAIMER,
+    }

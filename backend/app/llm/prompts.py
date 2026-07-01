@@ -27,6 +27,12 @@ INSUFFICIENT_BRIEFING = (
     "\n{disclaimer}"
 )
 
+# 합성 LLM 장애 시 사용자에게 내보내는 안내(면책 포함, 재시도 유도).
+SYNTH_FAILURE_BRIEFING = (
+    "[안내] 브리핑 합성 중 일시적 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.\n"
+    "\n{disclaimer}"
+)
+
 # 안전 가드레일이 차단 시 사용자에게 안내하는 제안형 메시지.
 GUARDRAIL_SAFE_MESSAGE = (
     "MacroLens는 개별 종목 매매 신호나 투자 추천을 제공하지 않습니다. "

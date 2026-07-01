@@ -17,7 +17,7 @@ from app.core.logging import get_logger
 from app.core.types import Source
 from app.llm import prompts
 
-from .nodes import Nodes
+from .nodes import Nodes, briefing_prompt, build_briefing
 from .state import MAX_RETRIEVAL_ROUNDS, MacroLensState
 from .fixtures import FixtureCollector, FixtureRetriever
 
@@ -113,7 +113,7 @@ def build_graph(
     g.add_edge("briefing_synthesizer", END)
 
     compiled = g.compile()
-    return GraphApp(compiled, llm=llm)
+    return GraphApp(compiled, nodes)
 
 
 # --- GraphApp (stream 계약) -------------------------------------------------
@@ -142,13 +142,14 @@ class GraphApp:
     """compiled LangGraph 를 감싸 SSE 이벤트 스트림으로 노출한다.
 
     최종 합성은 분석 그래프 완주(결정적 structured 노드) 후 ``llm.stream()`` 으로
-    토큰을 **실시간** 산출한다(LLM v1.1). stream 미지원 provider·근거부족·가드레일·합성장애
-    경로는 기존처럼 템플릿 본문을 줄 단위로 청크한다(후방호환).
+    토큰을 **실시간** 산출하며(LLM v1.1), 스트림된 본문을 그대로 BriefingResult 로 확정·영속화한다
+    (합성 LLM 단일 호출). stream 미지원 provider·근거부족·합성장애 경로는 노드가 만든 템플릿
+    본문을 줄 단위로 청크한다(후방호환).
     """
 
-    def __init__(self, compiled, llm=None) -> None:
+    def __init__(self, compiled, nodes: Nodes) -> None:
         self._compiled = compiled
-        self._llm = llm
+        self._nodes = nodes
 
     def stream(self, state_in: MacroLensState) -> Iterator[dict]:
         merged: dict = dict(state_in)
@@ -200,58 +201,42 @@ class GraphApp:
             if items:
                 yield {"type": "sources", "items": items}
 
-    # --- 브리핑 토큰 emit (실시간 stream 우선, 폴백=청크) ---
+    # --- 브리핑 토큰 emit + 확정/영속화 (합성 LLM 단일 호출) ---
     def _emit_briefing_tokens(self, briefing: dict, merged: dict) -> Iterator[dict]:
-        body = briefing.get("body", "")
-        if self._is_live_streamable(briefing, merged):
+        if briefing.get("_deferred"):
+            # 정상 경로: 여기서 최초이자 유일하게 합성 LLM 을 스트림 호출한다.
+            text, ok = "", False
             try:
                 emitted: list[str] = []
-                for delta_text in self._llm.stream(self._briefing_messages(merged), temperature=0.2):
+                for delta_text in self._nodes.llm.stream(briefing_prompt(merged), temperature=0.2):
                     if not delta_text:
                         continue
                     emitted.append(delta_text)
                     yield {"type": "token", "text": delta_text}
-                streamed = "".join(emitted)
-                # 면책 강제(AC-G2): 실시간 스트림에 누락되면 마지막 토큰으로 보강.
-                if streamed.strip() and prompts.DISCLAIMER not in streamed:
-                    yield {"type": "token", "text": f"\n\n{prompts.DISCLAIMER}"}
-                if streamed.strip():
-                    return
-            except Exception:  # pragma: no cover - 방어: 스트림 실패 시 청크 폴백
-                logger.warning("live token stream failed; falling back to chunked body")
-        # 폴백: 저장된 본문을 줄 단위로 청크(기존 동작 = 후방호환).
-        for line in _chunk_text(body):
-            yield {"type": "token", "text": line}
-
-    def _is_live_streamable(self, briefing: dict, merged: dict) -> bool:
-        """정상 LLM 합성 경로에서만 실시간 스트림(근거부족·합성장애·가드레일·미지원 provider 제외)."""
-        if not callable(getattr(self._llm, "stream", None)):
-            return False
-        if merged.get("blocked"):
-            return False
-        insufficient = (not merged.get("data_sufficient", True)) or (not merged.get("rag_context"))
-        if insufficient:
-            return False
-        body = briefing.get("body", "")
-        if body.lstrip().startswith("[안내]"):  # 합성 LLM 장애 폴백 본문
-            return False
-        return bool(body)
-
-    def _briefing_messages(self, merged: dict) -> list[dict]:
-        """node 와 동일 인자로 briefing 프롬프트 재구성(실시간 합성 스트림용)."""
-        deepdive = merged.get("intent") == "deepdive"
-        depth = "background" if deepdive else merged.get("depth", "evidence")
-        return prompts.briefing_messages(
-            merged.get("macro_data", {}),
-            merged.get("transitions", []),
-            merged.get("sector_ranking", []),
-            merged.get("coin_mapping", []),
-            merged.get("changes", []),
-            depth,
-            insufficient=False,
-            deepdive=deepdive,
-            evidence=merged.get("rag_context", []),
-        )
+                text = "".join(emitted)
+                if text.strip():
+                    # 면책 강제(AC-G2): 실시간 스트림에 누락되면 마지막 토큰으로 보강.
+                    if prompts.DISCLAIMER not in text:
+                        tail = f"\n\n{prompts.DISCLAIMER}"
+                        text += tail
+                        yield {"type": "token", "text": tail}
+                    ok = True
+            except Exception:  # 스트림 실패 → 장애 안내로 폴백
+                logger.warning("live token stream failed; emitting failure notice")
+            if not ok:
+                text = prompts.SYNTH_FAILURE_BRIEFING.format(disclaimer=prompts.DISCLAIMER)
+                for line in _chunk_text(text):
+                    yield {"type": "token", "text": line}
+            final = build_briefing(merged, text)
+        else:
+            # 근거부족·비스트리밍 provider: 노드가 만든 본문을 청크.
+            body = briefing.get("body", "")
+            for line in _chunk_text(body):
+                yield {"type": "token", "text": line}
+            final = {k: v for k, v in briefing.items() if k != "_deferred"}
+        # 확정본을 merged 에 반영(done 요약용) + 영속화(전환 탐지 기준).
+        merged["briefing"] = final
+        self._nodes.persist_briefing(merged, final)
 
     def _done_event(self, merged: dict) -> dict:
         briefing = merged.get("briefing") or {}
