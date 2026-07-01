@@ -221,8 +221,9 @@ class GraphApp:
                         text += tail
                         yield {"type": "token", "text": tail}
                     ok = True
-            except Exception:  # 스트림 실패 → 장애 안내로 폴백
-                logger.warning("live token stream failed; emitting failure notice")
+            except Exception as e:  # 스트림 실패 → 장애 안내로 폴백(원인은 로그에 상세 기록)
+                detail = getattr(e, "internal_detail", None) or f"{type(e).__name__}: {e}"
+                logger.warning("live token stream failed; emitting failure notice — %s", detail)
             if not ok:
                 text = prompts.SYNTH_FAILURE_BRIEFING.format(disclaimer=prompts.DISCLAIMER)
                 for line in _chunk_text(text):
