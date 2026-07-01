@@ -21,8 +21,12 @@ def client(monkeypatch):
 
     def _build():
         deps.container.store = store
+        deps.container.collector = None   # build_graph → FixtureCollector
+        deps.container.retriever = None   # build_graph → FixtureRetriever
         deps.container.llm = MockLLM()
         deps.container.chroma_status = "ok"
+        deps.container.default_provider = "solar"
+        deps.container._graphs = {}
         deps.container.graph = build_graph(llm=MockLLM(), store=store)
 
     monkeypatch.setattr(deps.container, "build", _build)
@@ -103,4 +107,36 @@ def test_chat_guardrail_block(client):
     events = _parse_sse(r.text)
     # 분석 섹션 없이 안전 안내 후 done
     assert not any(t == "section" for t, _ in events)
+    assert events[-1][0] == "done"
+
+
+def test_providers_list(client):
+    r = client.get("/api/v1/providers")
+    assert r.status_code == 200
+    body = r.json()
+    names = [p["name"] for p in body["providers"]]
+    assert set(names) == {"solar", "claude", "mock"}
+    # mock 은 항상 configured=True
+    assert next(p for p in body["providers"] if p["name"] == "mock")["configured"] is True
+    assert body["active"]
+
+
+def test_provider_validate_mock_ok(client):
+    # mock 은 네트워크 없이 항상 ok
+    r = client.post("/api/v1/providers/validate", json={"provider": "mock"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["provider"] == "mock" and body["ok"] is True
+
+
+def test_provider_validate_rejects_unknown(client):
+    r = client.post("/api/v1/providers/validate", json={"provider": "gpt"})
+    assert r.status_code == 422  # Literal 검증
+
+
+def test_chat_with_mock_provider_override(client):
+    # provider=mock 명시 → 정상 스트림(기본 provider와 무관하게 동작)
+    r = client.post("/api/v1/chat", json={"message": "FOMC 발표 후 점검", "provider": "mock"})
+    assert r.status_code == 200
+    events = _parse_sse(r.text)
     assert events[-1][0] == "done"

@@ -12,6 +12,11 @@ class ChatRequest(BaseModel):
     mode: Optional[Literal["briefing", "whatif", "deepdive"]] = None
     market_scope: Optional[list[Literal["KR", "US"]]] = None
     depth: Optional[Literal["conclusion", "evidence", "background"]] = None
+    provider: Optional[Literal["solar", "claude", "mock"]] = None  # 사용자 선택 LLM
+
+
+class ProviderValidateRequest(BaseModel):
+    provider: Literal["solar", "claude", "mock"]
 
 
 class PinsBody(BaseModel):

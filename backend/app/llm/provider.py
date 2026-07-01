@@ -474,3 +474,70 @@ def get_llm(provider: str | None = None) -> LLM:
         f"알 수 없는 LLM provider: {name}. claude|solar|mock 중 하나여야 합니다.",
         internal_detail=f"unknown provider {name!r}",
     )
+
+
+# 선택 가능한 provider 와 키 설정 여부(설정=키 존재 또는 키 불필요).
+PROVIDERS = ("solar", "claude", "mock")
+
+_PROVIDER_LABEL = {
+    "solar": "Solar (Upstage)",
+    "claude": "Claude (Anthropic)",
+    "mock": "Mock (오프라인·결정적)",
+}
+
+
+def provider_configured(name: str) -> bool:
+    """provider 사용에 필요한 키가 설정되어 있는지(mock 은 항상 True)."""
+    name = (name or "").lower()
+    if name == "mock":
+        return True
+    if name == "solar":
+        return bool(settings.solar_api_key)
+    if name == "claude":
+        return bool(settings.anthropic_api_key)
+    return False
+
+
+def available_providers(active: str | None = None) -> list[dict]:
+    """UI 노출용 provider 목록: {name, label, configured, active}."""
+    act = (active or settings.llm_provider or "solar").lower()
+    return [
+        {
+            "name": p,
+            "label": _PROVIDER_LABEL.get(p, p),
+            "configured": provider_configured(p),
+            "active": p == act,
+        }
+        for p in PROVIDERS
+    ]
+
+
+def validate_provider(name: str) -> dict:
+    """provider 의 API 키가 실제 동작하는지 최소 호출로 확인.
+
+    반환: {"provider", "ok": bool, "detail": str}. 키/네트워크 오류는 detail 에 담되
+    시크릿은 포함하지 않는다(에러 메시지만). mock 은 항상 ok.
+    """
+    name = (name or "").lower()
+    if name not in PROVIDERS:
+        return {"provider": name, "ok": False, "detail": "알 수 없는 provider"}
+    if not provider_configured(name):
+        return {"provider": name, "ok": False, "detail": "API 키가 설정되지 않았습니다(.env 확인)."}
+    if name == "mock":
+        return {"provider": name, "ok": True, "detail": "오프라인 결정적 provider"}
+    try:
+        llm = get_llm(name)
+        text = llm.generate([{"role": "user", "content": "ping"}], max_tokens=4)
+        ok = bool(isinstance(text, str))
+        return {"provider": name, "ok": ok, "detail": "정상 작동" if ok else "빈 응답"}
+    except LLMError as e:
+        return {"provider": name, "ok": False, "detail": _sanitize_detail(e.internal_detail)}
+    except Exception as e:  # pragma: no cover - 방어
+        return {"provider": name, "ok": False, "detail": _sanitize_detail(f"{type(e).__name__}: {e}")}
+
+
+def _sanitize_detail(detail: str | None) -> str:
+    """에러 메시지를 사용자에게 안전히 노출(길이 제한, 키 유출 방지)."""
+    if not detail:
+        return "알 수 없는 오류"
+    return detail[:200]

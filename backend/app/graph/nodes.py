@@ -245,14 +245,27 @@ class Nodes:
             logger.warning("briefing persist failed: %s", getattr(e, "internal_detail", e))
 
 
+# 라벨만 있는 줄(마크다운 헤더/구획 표지)은 결론 후보에서 건너뛴다.
+_SECTION_LABELS = {"결론", "근거", "주의", "전환", "코인", "요약", "워치포인트", "핵심"}
+
+
 def _first_line(text: str) -> str:
+    """본문에서 결론 한 줄을 뽑는다. '**결론**'·'[결론]'·'# 결론' 같은 라벨 줄은 건너뛴다."""
     for ln in text.splitlines():
-        s = ln.strip().lstrip("#").strip()
-        if s:
-            # '[결론] ...' 형태면 라벨 제거
-            if s.startswith("[") and "]" in s:
-                s = s.split("]", 1)[1].strip()
-            return s
+        s = ln.strip()
+        if not s:
+            continue
+        # '[결론] ...' 형태면 라벨 제거
+        if s.startswith("[") and "]" in s:
+            s = s.split("]", 1)[1].strip()
+        # 마크다운 헤더(#)·볼드(**) 표지 제거
+        s = s.lstrip("#").strip().strip("*").strip()
+        if not s:
+            continue
+        # 라벨만 있는 줄(예: '결론', '**결론**', '결론:')이면 다음 줄로
+        if s.rstrip(":").strip() in _SECTION_LABELS:
+            continue
+        return s
     return text.strip()[:120]
 
 

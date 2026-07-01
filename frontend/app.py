@@ -49,11 +49,21 @@ def _init_state() -> None:
     ss.setdefault("last_briefing", None)   # BriefingState
     ss.setdefault("history", [])           # [make_history_entry(...)] 최신순
     ss.setdefault("view_idx", None)        # 히스토리에서 다시 보기 인덱스
+    ss.setdefault("provider", None)        # 사용자 선택 LLM(None=서버 기본)
+    ss.setdefault("providers", [])         # [{name,label,configured,active}]
+    ss.setdefault("provider_check", {})    # {provider: {ok, detail}}
     if "pins" not in ss:
         try:
             ss["pins"] = client.get_pins()
         except Exception:
             ss["pins"] = []
+    if not ss["providers"]:
+        try:
+            info = client.list_providers()
+            ss["providers"] = info.get("providers", [])
+            ss["provider"] = info.get("active")
+        except Exception:
+            ss["providers"] = []
 
 
 _init_state()
@@ -184,6 +194,7 @@ def run_stream(message: str, mode: str | None, body_container) -> BriefingState:
             depth=DEPTH_LABELS[st.session_state["depth"]],
             mode=mode,
             thread_id=st.session_state.get("thread_id"),
+            provider=st.session_state.get("provider"),
         ):
             state.apply(event)
             if event.get("type") == "status":
@@ -208,6 +219,41 @@ def record_briefing(state: BriefingState, query: str) -> None:
     del st.session_state["history"][20:]  # 최근 20건만 유지
 
 
+def provider_selector() -> None:
+    """LLM provider 선택 + 키 동작 확인(사용자에게 정상 여부 표시)."""
+    providers = st.session_state.get("providers") or []
+    if not providers:
+        st.caption("provider 목록을 불러오지 못했습니다.")
+        return
+    names = [p["name"] for p in providers]
+    labels = {
+        p["name"]: p["label"] + ("  ✓키" if p["configured"] else "  ✕키없음")
+        for p in providers
+    }
+    cur = st.session_state.get("provider") or names[0]
+    idx = names.index(cur) if cur in names else 0
+    sel = st.selectbox("LLM provider", names, index=idx, format_func=lambda n: labels.get(n, n))
+    st.session_state["provider"] = sel
+
+    pinfo = next((p for p in providers if p["name"] == sel), {})
+    if not pinfo.get("configured"):
+        st.warning("이 provider는 API 키가 없습니다(.env 확인). 선택 시 오류가 납니다.")
+
+    if st.button("🔑 키 동작 확인", use_container_width=True):
+        with st.spinner("확인 중…"):
+            try:
+                st.session_state["provider_check"][sel] = client.validate_provider(sel)
+            except Exception as e:
+                st.session_state["provider_check"][sel] = {"ok": False, "detail": f"확인 요청 실패: {e}"}
+
+    chk = st.session_state["provider_check"].get(sel)
+    if chk is not None:
+        if chk.get("ok"):
+            st.success(f"✅ {sel} — 키 정상 작동")
+        else:
+            st.error(f"❌ {sel} — {chk.get('detail', '동작 실패')}")
+
+
 # --- 사이드바 --------------------------------------------------------------
 with st.sidebar:
     st.title("MacroLens")
@@ -215,9 +261,12 @@ with st.sidebar:
 
     try:
         h = client.health()
-        st.success(f"backend ok · LLM={h.get('llm_provider')} · chroma={h.get('chroma')}")
+        st.success(f"backend ok · 기본 LLM={h.get('llm_provider')} · chroma={h.get('chroma')}")
     except Exception:
         st.error("backend 연결 불가 (8200)")
+
+    provider_selector()
+    st.divider()
 
     st.session_state["market_scope"] = st.multiselect(
         "시장", ["KR", "US"], default=st.session_state["market_scope"]

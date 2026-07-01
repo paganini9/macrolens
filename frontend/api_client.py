@@ -178,6 +178,22 @@ class MacroLensClient:
         r.raise_for_status()
         return r.json().get("pinned_sectors", [])
 
+    def list_providers(self) -> dict:
+        """선택 가능한 LLM provider 목록 + 활성 provider."""
+        r = httpx.get(f"{self.base_url}/api/v1/providers", timeout=10.0)
+        r.raise_for_status()
+        return r.json()
+
+    def validate_provider(self, provider: str) -> dict:
+        """선택한 provider 의 키 동작 여부 확인 → {provider, ok, detail}."""
+        r = httpx.post(
+            f"{self.base_url}/api/v1/providers/validate",
+            json={"provider": provider},
+            timeout=30.0,
+        )
+        r.raise_for_status()
+        return r.json()
+
     def set_pins(self, sectors: list[str]) -> list[str]:
         r = httpx.put(
             f"{self.base_url}/api/v1/pins",
@@ -195,6 +211,7 @@ class MacroLensClient:
         depth: Optional[str] = None,
         mode: Optional[str] = None,
         thread_id: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Iterator[dict]:
         """POST /chat 를 SSE 로 소비해 이벤트 dict 를 점진 yield."""
         body: dict = {"message": message}
@@ -206,6 +223,8 @@ class MacroLensClient:
             body["mode"] = mode
         if thread_id:
             body["thread_id"] = thread_id
+        if provider:
+            body["provider"] = provider
         with httpx.stream(
             "POST", f"{self.base_url}/api/v1/chat", json=body, timeout=self.timeout
         ) as resp:
